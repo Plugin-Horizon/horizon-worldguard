@@ -1,0 +1,21 @@
+[package]
+name = "mod-worldguard"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The launcher points this at the Horizon source it builds the game from.
+horizon-client = { git = "https://github.com/horizon-rust/horizon", rev = "a589a3dd9be04fa7f17667c0175711aaa92e1147" }
+toml = "1.1"
+
+# `worldedit_server` (optional mod dependency, horizon-mixin.toml) is added by the launcher together with
+# a `worldedit_server` feature; it is not declared here (docs/native-mods.md, "Dependencies between trait
+# mods").
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("worldedit_server"))'] }

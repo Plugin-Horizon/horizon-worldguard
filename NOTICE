@@ -1,0 +1,16 @@
+horizon-worldguard
+
+This mod is derived from WorldGuard (https://github.com/EngineHub/WorldGuard), a suite of tools for
+Minecraft, and is distributed under the GNU Lesser General Public License, version 3 or (at your
+option) any later version (see LICENSE).
+
+Copyright (C) sk89q <http://www.sk89q.com>
+Copyright (C) WorldGuard team and contributors
+
+The layout of the region file (regions.yml), the flag names, the command syntax, the permission nodes
+and the messages follow WorldGuard. WorldGuard's own source is LGPL-3.0-or-later; it uses WorldEdit
+(https://github.com/EngineHub/WorldEdit, GPL-3.0) for its selections, boxes and commands. Nothing of
+WorldEdit's source is included here; the boxes of `/rg info`, `/rg list` and `/rg flags` are
+approximations of WorldEdit's components.
+
+Modifications for Horizon (https://github.com/horizon-rust/horizon) are by Detimes and contributors.

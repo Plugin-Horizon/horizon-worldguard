@@ -1,0 +1,18 @@
+[mod]
+id = "worldguard"
+version = "0.1.0"
+
+# The Horizon commit this was written against (not built yet: see STATUS.md). The hook API it
+# uses is on the unmerged `hooks-all` branch (teleport, block_place, player_move, item_dropped_v2);
+# the title helper is on `hooks-b-all`, so a build needs both merged.
+[compatibility]
+horizon_revision = "b13dbf0687b545431172466ab4b91d19c3976405"
+
+# A trait mod: every hook goes through horizon_client::mod_api::Hooks, no injections.
+[api]
+path = "api"
+
+# Selections for /rg define, redefine, claim and select come from the world editing mod when it
+# is installed (SELECTION.md). Without it those commands report that there is no selection.
+[dependencies]
+worldedit_server = { version = ">=0", optional = true }
