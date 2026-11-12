@@ -1,14 +1,10 @@
-# The engine-free logic of the mod, built and tested on its own: `cargo test` here.
-# Its source is api/src/wg/, which the trait mod includes as a module.
 [package]
-name = "horizon-worldguard-core"
+name = "worldguard-core"
 version = "0.1.0"
 edition = "2024"
 license = "LGPL-3.0-or-later"
 publish = false
-
-[lib]
-path = "../api/src/wg/mod.rs"
+description = "WorldGuard native mod: region model, rules and commands (engine-free), shared by its hooks"
 
 [dependencies]
 toml = "=1.1.6"

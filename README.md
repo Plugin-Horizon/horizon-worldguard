@@ -1,8 +1,8 @@
 # horizon-worldguard
 
-> **Unofficial Rust port of WorldGuard for the Horizon server (https://github.com/horizon-rust/horizon). Not affiliated with or endorsed by the WorldGuard authors.**
+> **Unofficial Rust port of WorldGuard for the Horizon server (https://github.com/arismoko/horizon). Not affiliated with or endorsed by the WorldGuard authors.**
 
-Region protection for [Horizon](https://github.com/horizon-rust/horizon) dedicated servers, as a
+Region protection for [Horizon](https://github.com/arismoko/horizon) dedicated servers, as a
 native trait mod: cuboid and polygon regions with priorities, parents, owners and members, the
 region flags, the `/rg` commands, and the same `regions.yml` files as the Paper plugin, so a server
 can move between the two without converting anything.
@@ -15,8 +15,15 @@ flags, defaults, commands and messages follow WorldGuard's source (the `RegionCo
 `Flags` classes), ported to Rust for Horizon. The licence of this mod is therefore the
 GNU Lesser General Public License version 3 (see LICENSE); the copyright holders are in NOTICE.
 
-**State: written without building the engine (see STATUS.md and GAPS.md).** The rules are
-unit-tested (`core/`); the hook glue has not run yet.
+> **Built for and working only with [arismoko/horizon](https://github.com/arismoko/horizon)** (the Horizon fork that carries the mod API). [horizon-rust/horizon](https://github.com/horizon-rust/horizon) is experimental for mods and not supported: the earlier version for its native hooks / horizon-mixins is frozen on the `horizon-plain` branch (work stopped on 2026-11-12).
+
+## Which Horizon
+
+This is a native trait mod: `horizon-mod.toml`, a `Cargo.toml` that depends on `horizon-mod-api`, `src/lib.rs` with the hooks, and the plugin logic in the `core/` crate (plain Rust, no engine needed for its tests).
+
+- Pin: `[native] horizon = "54090ee36c4e2c7b43b66db864220c577b94b7e0"` in `horizon-mod.toml` (game `26.3`). That is a development build of arismoko/horizon `main` plus mod API additions that are not all merged upstream yet, so a stock `main` may lack some host methods this mod calls until they land.
+- It compiled and loaded on that build and was smoke-tested there; it has not seen a long run with real players. Treat it as experimental.
+- Feature descriptions below were written for the earlier horizon-rust version; where they name engine calls (`native_*`) or old file paths, read them as descriptions only. The Known gaps list is current.
 
 ## What it does
 
@@ -37,7 +44,7 @@ unit-tested (`core/`); the hook glue has not run yet.
   remove, addmember, addowner, removemember, removeowner, teleport, load, save, bypass,
   migrateheights`, with the documented aliases and options; `/wg reload|flushstates|running|version`.
 
-Full list with what is partial: STATUS.md. What Horizon lacks for the rest: GAPS.md.
+Full list with what is partial: the Known gaps section. What Horizon lacks for the rest: the Known gaps section.
 
 ## Selections
 
@@ -107,24 +114,24 @@ right; other players need the node (`worldguard.region.define`, `.claim`, `.list
 `worldguard.region.<command>.<id>`, `.member.<id>` or `.own.<id>`, with `flag.regions` and
 `flag.flags.<flag>[.<value>]`) through Horizon's `has_permission` (a permissions mod answers it; without
 one only operators pass), or a subcommand listed in `player-commands`. Bypass nodes are not read yet
-(GAPS.md).
+(the Known gaps section).
 
-## Layout and build
+## Build
 
-- `api/` — the trait mod (`[api]` in `horizon-mixin.toml`): `src/lib.rs` maps Horizon's hooks to
-  the rules, `src/we_selection.rs` adapts the world editing mod's selections.
-- `api/src/wg/` — the rules, with no Horizon types: YAML, shapes, flags, regions, region files,
-  queries, protection decisions, movement, commands.
-- `core/` — builds `api/src/wg/` as a crate of its own: `cd core && cargo test`.
+Build it as a native trait mod with arismoko's launcher (see the "native mods" how-to in the arismoko/horizon docs):
 
-Build the mod as any trait mod: put this folder into the launcher's mods and build the game
-(docs/native-mods.md, "Trait mods"). It needs no injections.
+```sh
+horizon-launcher native-build <path to this folder> --server-output <dir> --version <tag> --trust-native-code
+```
 
-## Untested
+`--trust-native-code` is your consent to compile and run this code inside the server. The logic crate tests run without the engine: `(cd core && cargo test)`.
 
-Everything in `api/src/lib.rs` (never compiled against the engine), and the round trip with files
-written by the Paper plugin beyond the documented layout. STATUS.md lists what to test first.
+## Known gaps
 
-## Contributing
+What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` in `src/lib.rs`):
 
-Pull requests and improvements are always welcome! Open an issue or a PR -- direct pushes to main are disabled, every change goes through review.
+- `/rg define`, `redefine`, `claim` and `select` report that there is no selection (no WorldEdit selection API on arismoko yet).
+- Colour codes are dropped (messages are plain), and titles go to the action bar.
+- Portal use, chorus-fruit and `/tp` teleports cannot be refused; a rescue teleport puts the player back on the next tick.
+- The source entity of an explosion and the kind of a spreading fluid are not told: the nearest tracked explosive names the blast, water-flow and lava-flow apply to any fluid.
+- Farmland trampling and a vehicle leaving a region cannot be held back.
