@@ -2,7 +2,7 @@ id = "worldguard"
 name = "WorldGuard"
 version = "0.1.0"
 description = "Region protection (WorldGuard rules and /rg, /wg commands) for Horizon servers, as a native trait mod."
-authors = ["CoreSMP"]
+authors = ["Plugin-Horizon contributors"]
 api = "0.2"
 capabilities = ["registries"]
 
