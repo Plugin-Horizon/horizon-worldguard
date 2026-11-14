@@ -13,11 +13,12 @@ use mod_api::{
     LivingIncomingDamageEvent, PistonPreEvent, PlayerCommandEvent, PlayerLoggedInEvent,
     PlayerLoggedOutEvent, PlayerMoveEvent, PlayerRef, PlayerTeleportedEvent, RegisterCommandsEvent,
     RegisterConfigsEvent, RightClickBlockEvent, RunModCommandEvent, ServerChatEvent, ServerHost,
-    ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Text, TntPrimedEvent,
+    ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Suggestion, TabCompleteEvent, Text, TntPrimedEvent,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use wg::commands::{self, Effect, Players};
 use wg::config::{Config as WgConfig, DEFAULT_TOML};
 use wg::geom::BlockPos;
@@ -85,6 +86,8 @@ struct State {
     explosives: HashMap<u32, (String, String)>,
     /// Players who teleported since the last tick (exit-via-teleport).
     teleported: HashSet<u128>,
+    /// Players in `/god` mode (damage to them is cancelled).
+    god: HashSet<u128>,
 }
 
 impl Default for State {
@@ -104,15 +107,39 @@ impl Default for State {
             tells: Vec::new(),
             explosives: HashMap::new(),
             teleported: HashSet::new(),
+            god: HashSet::new(),
         }
     }
 }
 
-// TODO(arismoko-api: worldedit_selection): arismoko has no world-editing selection API, so
-// `/rg define`, `redefine`, `claim` and `select` report that there is no selection. The former
-// `we_selection.rs` (horizon-worldedit) is not ported.
+/// The player's WorldEdit selection (`worldedit::api`, the worldedit trait mod). Cuboids only: the
+/// port of WorldEdit has no polygon selections. Each call takes WorldEdit's lock for its own
+/// duration and calls nothing of ours while holding it.
+struct WeSelections;
+
+impl Selections for WeSelections {
+    fn get(&self, player: u128) -> Option<wg::selection::Selection> {
+        let (dimension, a, b) = worldedit::api::selection(player)?;
+        Some(wg::selection::Selection::Cuboid {
+            dimension,
+            a: BlockPos::from(a),
+            b: BlockPos::from(b),
+        })
+    }
+
+    fn set(&mut self, player: u128, selection: wg::selection::Selection) -> bool {
+        match selection {
+            wg::selection::Selection::Cuboid { dimension, a, b } => {
+                worldedit::api::select_cuboid(player, &dimension, a.arr(), b.arr());
+                true
+            }
+            wg::selection::Selection::Polygon { .. } => false,
+        }
+    }
+}
+
 fn new_selections() -> Box<dyn Selections + Send> {
-    Box::new(wg::selection::Store::default())
+    Box::new(WeSelections)
 }
 
 impl State {
@@ -563,7 +590,8 @@ impl Mod {
             }
             "running" | "queue" => vec!["&dThere are currently no running tasks.".into()],
             "" | "version" => vec![
-                format!("&dWorldGuard {}", env!("CARGO_PKG_VERSION")),
+                // The Java plugin's version (plugin.yml), not this port's crate version.
+                "&dWorldGuard 7.0.20+2410-0b6c3f1".to_owned(),
                 "&dhttp://www.enginehub.org".to_owned(),
                 "&7----------- Platforms -----------".to_owned(),
                 "&7* Horizon".to_owned(),
@@ -620,9 +648,272 @@ impl Mod {
     ) -> Vec<String> {
         match root {
             "rg" | "region" | "regions" => self.region_command(host, sender, args),
-            _ => self.wg_command(host, args),
+            "god" | "ungod" | "heal" | "slay" => self.general_command(host, root, sender, args),
+            _ => {
+                if let Some(s) = sender {
+                    if let Some(node) = wg_node(args) {
+                        let op_level = lock(&self.st).guard.cfg.op_level;
+                        if !may(&*host, s.uuid, node, op_level) {
+                            return vec![NO_PERMISSION.to_owned()];
+                        }
+                    }
+                }
+                self.wg_command(host, args)
+            }
         }
     }
+
+    /// WorldGuard's general commands `/god`, `/ungod`, `/heal`, `/slay` (own or `<player>`; the
+    /// `.other` node for another player). Not ported: `/stack`, `/stoplag`, `/halt-activity`,
+    /// `/locate` (see PORT_NOTES.md).
+    fn general_command(
+        &self,
+        host: &mut dyn ServerHost,
+        root: &str,
+        sender: Option<&Snap>,
+        args: &str,
+    ) -> Vec<String> {
+        let base = format!("worldguard.{}", if root == "ungod" { "god" } else { root });
+        let op_level = lock(&self.st).guard.cfg.op_level;
+        if let Some(s) = sender {
+            if !may(&*host, s.uuid, &base, op_level) {
+                return vec![NO_PERMISSION.to_owned()];
+            }
+        }
+        let (uuid, name, other) = match args.split_whitespace().next() {
+            None => match sender {
+                Some(s) => (s.uuid, s.name.clone(), false),
+                None => return vec!["&cA player is expected.".to_owned()],
+            },
+            Some(n) => {
+                if let Some(s) = sender {
+                    if !may(&*host, s.uuid, &format!("{base}.other"), op_level) {
+                        return vec![NO_PERMISSION.to_owned()];
+                    }
+                }
+                let st = lock(&self.st);
+                match st.names.get(&n.to_ascii_lowercase()).cloned() {
+                    Some((u, real)) if st.by_uuid.contains_key(&u) => (u, real, true),
+                    _ => return vec![format!("&cNo players matched query '{n}'.")],
+                }
+            }
+        };
+        let mut st = lock(&self.st);
+        match root {
+            "god" => {
+                st.god.insert(uuid);
+                vec![if other { format!("&dEnabled god mode for {name}.") } else { "&dGodmode enabled!".to_owned() }]
+            }
+            "ungod" => {
+                st.god.remove(&uuid);
+                vec![if other { format!("&dDisabled god mode for {name}.") } else { "&dGodmode disabled!".to_owned() }]
+            }
+            "heal" => {
+                // The name comes from the players seen on this server, never from the typed text.
+                st.commands.push(format!("effect give {name} minecraft:instant_health 1 10 true"));
+                st.commands.push(format!("effect give {name} minecraft:saturation 1 20 true"));
+                vec![if other { format!("&dHealed {name}.") } else { "&dHealed!".to_owned() }]
+            }
+            _ => {
+                st.commands.push(format!("kill {name}"));
+                vec![if other { format!("&dSlain {name}.") } else { "&dSlain!".to_owned() }]
+            }
+        }
+    }
+}
+
+const NO_PERMISSION: &str = "&cYou don't have permission to do that.";
+
+/// The node a `/wg` sub-command needs (`None`: open to everybody, the version).
+fn wg_node(args: &str) -> Option<&'static str> {
+    match args.split_whitespace().next().unwrap_or("").to_ascii_lowercase().as_str() {
+        "" | "version" => None,
+        "flushstates" | "clearstates" => Some("worldguard.flushstates"),
+        "running" | "queue" => Some("worldguard.running"),
+        "report" | "profile" | "stopprofile" | "debug" => Some("worldguard.report"),
+        _ => Some("worldguard.reload"),
+    }
+}
+
+// --- slash forms ----------------------------------------------------------------------------------
+//
+// WorldGuard's commands (`/god`, `/rg`, `/wg`...) exist with ONE slash only; `//god` is not a command. The
+// player-command hook hears the line without its slashes, and the engine builds so far trimmed ALL of them, so the two
+// look alike. An engine that trims only one slash delivers `/god` for a typed `//god`: from the first line that begins
+// with `/` the double-slash forms of our roots are refused as unknown.
+
+static SLASH_AWARE: AtomicBool = AtomicBool::new(false);
+
+const OUR_ROOTS: &[&str] = &["rg", "region", "regions", "wg", "worldguard", "god", "ungod", "heal", "slay"];
+
+// --- completions ----------------------------------------------------------------------------------
+//
+// `/rg` and `/wg` are one `<args:text>` argument for the engine, so the words come from the `tab_complete` hook: the
+// sub-commands, the options, the flag names, the region ids of the player's world (or of `-w <world>`), the worlds,
+// the online players and the values of state flags (`allow`, `deny`).
+
+/// `commands::usages()` split into words, built once. The first word is the sub-command.
+fn rg_usage_words() -> &'static Vec<Vec<String>> {
+    static WORDS: OnceLock<Vec<Vec<String>>> = OnceLock::new();
+    WORDS.get_or_init(|| commands::usages().iter().map(|u| u.split_whitespace().map(str::to_owned).collect()).collect())
+}
+
+/// A usage word `<name:kind>` or `[name:kind]`: its name and kind.
+fn usage_arg(word: &str) -> Option<(&str, &str)> {
+    word.strip_prefix('<')
+        .and_then(|w| w.strip_suffix('>'))
+        .or_else(|| word.strip_prefix('[').and_then(|w| w.strip_suffix(']')))?
+        .split_once(':')
+}
+
+fn starts_with_any_case(word: &str, prefix: &str) -> bool {
+    word.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase())
+}
+
+/// Whether the player may use `/rg <sub>` at all: an operator, a `player-commands` entry, or a provider's grant of
+/// `worldguard.region.<sub>` (also its `.own` / `.member` forms, which apply to regions the player stands in).
+fn may_rg_sub(host: &dyn ServerHost, uuid: u128, op_level: u8, player_commands: &[String], sub: &str) -> bool {
+    let Some(p) = host.player(uuid) else { return false };
+    if p.permission_level(host).unwrap_or(0) >= op_level || player_commands.iter().any(|c| c == sub) {
+        return true;
+    }
+    ["", ".own", ".member"].iter().any(|tail| p.permission_value(host, &format!("worldguard.region.{sub}{tail}")) == Some(true))
+}
+
+impl Mod {
+    /// The words that complete the last word of `rest` (what follows `/rg `).
+    fn complete_region(&self, host: &dyn ServerHost, uuid: u128, rest: &str) -> Vec<String> {
+        let tokens: Vec<&str> = rest.split(' ').collect();
+        let n = tokens.len() - 1;
+        let prefix = tokens[n];
+        let (op_level, player_commands, world_of_player) = {
+            let st = lock(&self.st);
+            let dimension = host
+                .player(uuid)
+                .and_then(|p| p.entity().level(host))
+                .map(|l| l.dimension_id().to_string())
+                .unwrap_or_else(|| OVERWORLD.to_owned());
+            (st.guard.cfg.op_level, st.guard.cfg.player_commands.clone(), st.guard.cfg.world_of(&dimension))
+        };
+        let mut out: Vec<String> = Vec::new();
+        let add = |out: &mut Vec<String>, word: &str| {
+            if starts_with_any_case(word, prefix) && !out.iter().any(|w| w == word) {
+                out.push(word.to_owned());
+            }
+        };
+        let usages = rg_usage_words();
+        if n == 0 {
+            for u in usages {
+                if may_rg_sub(host, uuid, op_level, &player_commands, &u[0]) {
+                    add(&mut out, &u[0]);
+                }
+            }
+            return out;
+        }
+        let Some(sub) = commands::canonical(tokens[0]) else { return out };
+        if !may_rg_sub(host, uuid, op_level, &player_commands, sub) {
+            return out;
+        }
+        // `-w <world>` typed before the cursor names the world the region ids come from.
+        let world = tokens[..n]
+            .windows(2)
+            .find(|w| w[0].eq_ignore_ascii_case("-w"))
+            .map(|w| w[1].to_owned())
+            .unwrap_or(world_of_player);
+        for usage in usages {
+            if usage[0] != sub {
+                continue;
+            }
+            for i in 1..=n {
+                let Some(word) = usage.get(i) else { break };
+                let arg = usage_arg(word);
+                if i < n {
+                    // A word typed before the cursor has to fit the usage's word at that place.
+                    let typed = tokens[i];
+                    let fits = match arg {
+                        None => typed.eq_ignore_ascii_case(word),
+                        Some((_, "integer")) => typed.parse::<i64>().is_ok(),
+                        Some(_) => true,
+                    };
+                    if !fits {
+                        break;
+                    }
+                    continue;
+                }
+                match arg {
+                    None => add(&mut out, word),
+                    Some((name, kind)) => match (name, kind) {
+                        ("id", _) | ("parent", _) => {
+                            let st = lock(&self.st);
+                            if let Some(w) = st.guard.worlds.get(&world) {
+                                for r in w.all() {
+                                    add(&mut out, &r.id);
+                                }
+                            }
+                            add(&mut out, "__global__");
+                        }
+                        ("world", _) => {
+                            let st = lock(&self.st);
+                            for w in st.guard.worlds.keys() {
+                                add(&mut out, w);
+                            }
+                        }
+                        ("group", _) => {
+                            for g in ["all", "members", "owners", "nonmembers", "nonowners", "none"] {
+                                add(&mut out, g);
+                            }
+                        }
+                        ("value", _) => {
+                            // `flag <id> <flag-name> [-g <group>] [value]`: the flag's own value words.
+                            let flag = usage.get(2).and_then(|f| wg::flags::FLAGS.iter().find(|d| d.name == f.as_str()));
+                            if let Some(def) = flag {
+                                let values: &[&str] = match def.kind {
+                                    wg::flags::Kind::State => &["allow", "deny"],
+                                    wg::flags::Kind::Bool => &["true", "false"],
+                                    wg::flags::Kind::GameMode => &["survival", "creative", "adventure", "spectator"],
+                                    _ => &[],
+                                };
+                                for v in values {
+                                    add(&mut out, v);
+                                }
+                            }
+                        }
+                        ("player", _) | ("others", _) | ("owners", _) | ("names", _) => {
+                            for p in host.players().server_players() {
+                                if let Some(name) = p.name(host) {
+                                    add(&mut out, &name);
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
+                }
+            }
+        }
+        out
+    }
+
+    /// The words that complete the last word of `rest` (what follows `/wg `).
+    fn complete_wg(&self, host: &dyn ServerHost, uuid: u128, rest: &str) -> Vec<String> {
+        if rest.contains(' ') {
+            return Vec::new();
+        }
+        let op_level = lock(&self.st).guard.cfg.op_level;
+        ["version", "reload", "flushstates", "running"]
+            .iter()
+            .filter(|sub| wg_node(sub).is_none_or(|node| may(host, uuid, node, op_level)))
+            .filter(|sub| starts_with_any_case(sub, rest))
+            .map(|sub| (*sub).to_owned())
+            .collect()
+    }
+}
+
+/// A provider's answer for `node`, else the operator level (the same rule as `KnownPlayers`).
+fn may(host: &dyn ServerHost, uuid: u128, node: &str, op_level: u8) -> bool {
+    host.player(uuid).is_some_and(|p| {
+        let level = p.permission_level(host).unwrap_or(0);
+        p.permission_value(host, node).unwrap_or(level >= op_level)
+    })
 }
 
 #[mod_api::horizon_mod]
@@ -659,11 +950,13 @@ impl Hooks for Mod {
                 .commands
                 .push(Command::new(&format!("{root} <args:text>")));
         }
-        for root in ["wg", "worldguard"] {
-            event.commands.push(Command::op(root, 2));
+        // `/wg` and the general commands are level 0 too: every path checks its node in
+        // `command_lines` (wg_node / general_command) before anything runs.
+        for root in ["wg", "worldguard", "god", "ungod", "heal", "slay"] {
+            event.commands.push(Command::new(root));
             event
                 .commands
-                .push(Command::op(&format!("{root} <args:text>"), 2));
+                .push(Command::new(&format!("{root} <args:text>")));
         }
     }
 
@@ -677,7 +970,7 @@ impl Hooks for Mod {
         };
         if !matches!(
             root.as_str(),
-            "rg" | "region" | "regions" | "wg" | "worldguard"
+            "rg" | "region" | "regions" | "wg" | "worldguard" | "god" | "ungod" | "heal" | "slay"
         ) {
             return Flow::Continue;
         }
@@ -840,6 +1133,7 @@ impl Hooks for Mod {
     fn player_logged_out(&self, _host: &mut dyn ServerHost, event: &mut PlayerLoggedOutEvent<'_>) {
         let mut st = lock(&self.st);
         st.tracker.forget(event.player);
+        st.god.remove(&event.player);
     }
 
     // -- blocks ----------------------------------------------------------------------------
@@ -1194,6 +1488,13 @@ impl Hooks for Mod {
             return Flow::Continue;
         }
         let st = lock(&self.st);
+        if st
+            .by_entity
+            .get(&event.entity)
+            .is_some_and(|v| st.god.contains(&v.uuid))
+        {
+            return Flow::Cancel;
+        }
         let Some(victim) = st.by_entity.get(&event.entity).map(|v| st.player(v)) else {
             return Flow::Continue;
         };
@@ -1352,11 +1653,43 @@ impl Hooks for Mod {
         }
     }
 
+    fn tab_complete(&self, host: &mut dyn ServerHost, event: &mut TabCompleteEvent<'_>) {
+        let command: &str = event.command;
+        let Some(first_space) = command.find(' ') else { return };
+        let root = command[..first_space].to_ascii_lowercase();
+        let rest = &command[first_space + 1..];
+        let words = match root.as_str() {
+            "rg" | "region" | "regions" => self.complete_region(&*host, event.player, rest),
+            "wg" | "worldguard" => self.complete_wg(&*host, event.player, rest),
+            _ => return,
+        };
+        let word_start = command.rfind(' ').map_or(0, |i| i + 1);
+        let (from, to) = (event.range[0], event.range[1]);
+        for w in words {
+            // The engine's range may begin before the word (it took the rest of the line for one argument).
+            let text = if word_start >= from { format!("{}{}", &command[from..word_start], w) } else { w };
+            if !event.suggestions.iter().any(|s| s.text == text) {
+                event.suggestions.push(Suggestion::new((from, to), text));
+            }
+        }
+    }
+
     fn player_command(
         &self,
         _host: &mut dyn ServerHost,
         event: &mut PlayerCommandEvent<'_>,
     ) -> Flow {
+        // `//god` is not a command: only once the engine tells the slash count apart (see `SLASH_AWARE`).
+        let double = event.command.starts_with('/');
+        if double {
+            SLASH_AWARE.store(true, Ordering::Relaxed);
+            let root = event.command.trim_start_matches('/').split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+            if OUR_ROOTS.contains(&root.as_str()) {
+                event.replies.push(line("&cUnknown or incomplete command, see below for error"));
+                event.cancelled = true;
+                return Flow::Cancel;
+            }
+        }
         let st = lock(&self.st);
         let Some(p) = st.cached(event.player) else {
             return Flow::Continue;
