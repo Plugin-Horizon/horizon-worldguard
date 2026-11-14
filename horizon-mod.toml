@@ -5,6 +5,10 @@ description = "Region protection (WorldGuard rules and /rg, /wg commands) for Ho
 authors = ["Plugin-Horizon contributors"]
 api = "0.2"
 capabilities = ["registries"]
+# The Java plugin's WorldEdit dependency (selections for /rg define, redefine, claim, select, -s). The launcher adds the
+# `worldedit` Cargo alias (the worldedit trait mod); do not declare it in Cargo.toml.
+[dependencies]
+worldedit = "^0.1"
 
 [native]
 # Development build of arismoko/horizon main plus mod API additions (see README).

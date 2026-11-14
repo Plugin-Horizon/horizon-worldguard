@@ -255,7 +255,7 @@ pub fn usages() -> Vec<String> {
     out
 }
 
-fn canonical(sub: &str) -> Option<&'static str> {
+pub fn canonical(sub: &str) -> Option<&'static str> {
     Some(match sub.to_ascii_lowercase().as_str() {
         "define" | "def" | "d" | "create" => "define",
         "redefine" | "update" | "move" => "redefine",
@@ -735,7 +735,7 @@ fn set_player_selection(guard: &Guard, ctx: &mut Ctx<'_>, world: &str, id: &str,
         ));
     };
     if !ctx.selections.set(p.subject.uuid, sel) {
-        return Err("Selections need the world editing mod.".into());
+        return Err("Polygon regions cannot be selected here: the world editing mod has no polygon selections.".into());
     }
     r.print(format!("Region selected as {}", reg.shape.type_name()));
     Ok(())
