@@ -13,4 +13,4 @@ and the messages follow WorldGuard. WorldGuard's own source is LGPL-3.0-or-later
 WorldEdit's source is included here; the boxes of `/rg info`, `/rg list` and `/rg flags` are
 approximations of WorldEdit's components.
 
-Modifications for Horizon (https://github.com/horizon-rust/horizon) are by Detimes and contributors.
+Modifications for Horizon (https://github.com/horizon-rust/horizon) are by LionSpacer.
