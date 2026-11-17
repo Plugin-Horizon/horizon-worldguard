@@ -1514,6 +1514,7 @@ fn add_people(guard: &mut Guard, ctx: &mut Ctx<'_>, a: &Args, r: &mut Reply, own
             && !w.ancestors(&id).iter().any(|p| !p.owners.is_empty())
             && let Some(p) = ctx.sender
             && !guard.is_admin(p)
+            // HMOD-GAP(region-scoped-nodes): `addowner.unclaimed.<id>` is per region and cannot be declared; refused here.
             && !ctx
                 .players
                 .has_permission(p.subject.uuid, &format!("worldguard.region.addowner.unclaimed.{id}"))

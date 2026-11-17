@@ -2,6 +2,8 @@
 //! `worldguard-core` crate (`core/`, the former `api/src/wg/`); this file maps arismoko's hooks and
 //! host calls onto them. Where arismoko has no API yet the line is marked
 //! `TODO(arismoko-api: <name>)` and says what is lost meanwhile. PORT_NOTES.md lists them all.
+
+pub mod worldguard_core;
 use mod_api::{
     TriState, ArmorStandManipulateEvent, AttackEntityEvent, BlockBurnEvent, BlockIgniteEvent,
     BlockSpreadEvent, BreakBlockEvent, BucketEmptyEvent, CanPlayerSleepEvent, Command,
@@ -14,8 +16,10 @@ use mod_api::{
     PlayerLoggedOutEvent, PlayerMoveEvent, PlayerRef, PlayerTeleportedEvent, RegisterCommandsEvent,
     RegisterConfigsEvent, RightClickBlockEvent, RunModCommandEvent, ServerChatEvent, ServerHost,
     ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Suggestion, TabCompleteEvent, Text, TntPrimedEvent,
+    InteractionResult, NodeDefault, PermissionGatherNodesEvent, PermissionLevel, PermissionNode, PermissionValueType,
 };
-use std::collections::{HashMap, HashSet};
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -393,22 +397,29 @@ fn bp_of(p: impl Into<[i32; 3]>) -> BlockPos {
 
 struct KnownPlayers<'a> {
     names: &'a HashMap<String, (u128, String)>,
-    host: &'a dyn ServerHost,
+    // The permission query needs the host mutably, and `Players` takes `&self`: the cell lends it for each query.
+    host: RefCell<&'a mut dyn ServerHost>,
     op_level: u8,
 }
 
+/// The typed node for one `worldguard.*` name (a Boolean, as the commands ask it).
+fn perm_node(name: &str) -> PermissionNode {
+    PermissionNode::new(name, PermissionValueType::Boolean)
+}
+
 impl Players for KnownPlayers<'_> {
-    // A permission provider's value for the node first (LuckPerms answers through the
-    // `player_permission_check` hook); where none decided, the operator level as before.
+    // The node's answer from the permission system (LuckPerms answers through the `player_permission_check` hook);
+    // a node that no one declared is refused, and so is any error: a denial, never a grant.
+    // HMOD-GAP(region-scoped-nodes): `worldguard.region.<perm>.<id>` (and `.own.`/`.member.`, `addowner.unclaimed.<id>`)
+    // depend on the region id, so they cannot be declared at gather time. They are refused here, which takes away the
+    // per-region grants of non-operators. Operators still pass through `guard.is_admin` before these are asked.
     fn has_permission(&self, uuid: u128, node: &str) -> bool {
-        let player = self.host.player(uuid);
-        if let Some(answer) = player.and_then(|p| p.permission_value(self.host, node)) {
-            return answer;
-        }
-        let level = player
-            .and_then(|p| p.permission_level(self.host))
-            .unwrap_or(0);
-        level >= self.op_level
+        let mut slot = self.host.borrow_mut();
+        let host: &mut dyn ServerHost = &mut **slot;
+        let Some(player) = host.player(uuid) else {
+            return false;
+        };
+        player.permission_bool(host, &perm_node(node)).unwrap_or(false)
     }
     fn resolve(&self, name: &str) -> Option<(u128, String)> {
         self.names.get(&name.to_ascii_lowercase()).cloned()
@@ -453,7 +464,7 @@ impl Mod {
         let op_level = st.guard.cfg.op_level;
         let known = KnownPlayers {
             names: &names,
-            host: &*host,
+            host: RefCell::new(&mut *host),
             op_level,
         };
         let State {
@@ -653,7 +664,7 @@ impl Mod {
                 if let Some(s) = sender {
                     if let Some(node) = wg_node(args) {
                         let op_level = lock(&self.st).guard.cfg.op_level;
-                        if !may(&*host, s.uuid, node, op_level) {
+                        if !may(&mut *host, s.uuid, node, op_level) {
                             return vec![NO_PERMISSION.to_owned()];
                         }
                     }
@@ -676,7 +687,7 @@ impl Mod {
         let base = format!("worldguard.{}", if root == "ungod" { "god" } else { root });
         let op_level = lock(&self.st).guard.cfg.op_level;
         if let Some(s) = sender {
-            if !may(&*host, s.uuid, &base, op_level) {
+            if !may(&mut *host, s.uuid, &base, op_level) {
                 return vec![NO_PERMISSION.to_owned()];
             }
         }
@@ -687,7 +698,7 @@ impl Mod {
             },
             Some(n) => {
                 if let Some(s) = sender {
-                    if !may(&*host, s.uuid, &format!("{base}.other"), op_level) {
+                    if !may(&mut *host, s.uuid, &format!("{base}.other"), op_level) {
                         return vec![NO_PERMISSION.to_owned()];
                     }
                 }
@@ -772,17 +783,19 @@ fn starts_with_any_case(word: &str, prefix: &str) -> bool {
 
 /// Whether the player may use `/rg <sub>` at all: an operator, a `player-commands` entry, or a provider's grant of
 /// `worldguard.region.<sub>` (also its `.own` / `.member` forms, which apply to regions the player stands in).
-fn may_rg_sub(host: &dyn ServerHost, uuid: u128, op_level: u8, player_commands: &[String], sub: &str) -> bool {
+fn may_rg_sub(host: &mut dyn ServerHost, uuid: u128, op_level: u8, player_commands: &[String], sub: &str) -> bool {
     let Some(p) = host.player(uuid) else { return false };
-    if p.permission_level(host).unwrap_or(0) >= op_level || player_commands.iter().any(|c| c == sub) {
+    if p.permission_level(&*host).unwrap_or(0) >= op_level || player_commands.iter().any(|c| c == sub) {
         return true;
     }
-    ["", ".own", ".member"].iter().any(|tail| p.permission_value(host, &format!("worldguard.region.{sub}{tail}")) == Some(true))
+    ["", ".own", ".member"].iter().any(|tail| {
+        p.permission_bool(&mut *host, &perm_node(&format!("worldguard.region.{sub}{tail}"))).unwrap_or(false)
+    })
 }
 
 impl Mod {
     /// The words that complete the last word of `rest` (what follows `/rg `).
-    fn complete_region(&self, host: &dyn ServerHost, uuid: u128, rest: &str) -> Vec<String> {
+    fn complete_region(&self, host: &mut dyn ServerHost, uuid: u128, rest: &str) -> Vec<String> {
         let tokens: Vec<&str> = rest.split(' ').collect();
         let n = tokens.len() - 1;
         let prefix = tokens[n];
@@ -790,7 +803,7 @@ impl Mod {
             let st = lock(&self.st);
             let dimension = host
                 .player(uuid)
-                .and_then(|p| p.entity().level(host))
+                .and_then(|p| p.entity().level(&*host))
                 .map(|l| l.dimension_id().to_string())
                 .unwrap_or_else(|| OVERWORLD.to_owned());
             (st.guard.cfg.op_level, st.guard.cfg.player_commands.clone(), st.guard.cfg.world_of(&dimension))
@@ -894,30 +907,68 @@ impl Mod {
     }
 
     /// The words that complete the last word of `rest` (what follows `/wg `).
-    fn complete_wg(&self, host: &dyn ServerHost, uuid: u128, rest: &str) -> Vec<String> {
+    fn complete_wg(&self, host: &mut dyn ServerHost, uuid: u128, rest: &str) -> Vec<String> {
         if rest.contains(' ') {
             return Vec::new();
         }
         let op_level = lock(&self.st).guard.cfg.op_level;
         ["version", "reload", "flushstates", "running"]
             .iter()
-            .filter(|sub| wg_node(sub).is_none_or(|node| may(host, uuid, node, op_level)))
+            .filter(|sub| wg_node(sub).is_none_or(|node| may(&mut *host, uuid, node, op_level)))
             .filter(|sub| starts_with_any_case(sub, rest))
             .map(|sub| (*sub).to_owned())
             .collect()
     }
 }
 
-/// A provider's answer for `node`, else the operator level (the same rule as `KnownPlayers`).
-fn may(host: &dyn ServerHost, uuid: u128, node: &str, op_level: u8) -> bool {
-    host.player(uuid).is_some_and(|p| {
-        let level = p.permission_level(host).unwrap_or(0);
-        p.permission_value(host, node).unwrap_or(level >= op_level)
-    })
+/// The node's answer from the permission system: its declared default is the operator level (`permission_gather_nodes`),
+/// so the level fallback is in the answer itself. An undeclared node or an error is a denial.
+fn may(host: &mut dyn ServerHost, uuid: u128, node: &str, _op_level: u8) -> bool {
+    host.player(uuid).is_some_and(|p| p.permission_bool(&mut *host, &perm_node(node)).unwrap_or(false))
 }
 
 #[mod_api::horizon_mod]
 impl Hooks for Mod {
+    fn permission_gather_nodes(&self, event: &mut PermissionGatherNodesEvent<'_>) {
+        // Every node known before any region exists. Their default is the operator level the string nodes fell back to
+        // (`op-permission-level`, 2 by default). Region-scoped nodes cannot be declared here (see `KnownPlayers`).
+        let mut names: BTreeSet<String> = [
+            "region.define",
+            "region.claim",
+            "region.list",
+            "region.list.own",
+            "region.migrateheights",
+            "region.migratedb",
+            "region.migrateuuid",
+            "region.load",
+            "region.save",
+            "region.unlimited",
+            "region.toggle-bypass",
+            "flushstates",
+            "running",
+            "report",
+            "reload",
+            "god",
+            "heal",
+            "slay",
+        ]
+        .iter()
+        .map(|n| format!("worldguard.{n}"))
+        .collect();
+        for n in ["god", "heal", "slay"] {
+            names.insert(format!("worldguard.{n}.other"));
+        }
+        // `/rg` subcommands: `worldguard.region.<sub>` and its `.own` / `.member` forms.
+        for sub in commands::usages().iter().filter_map(|u| u.split_whitespace().next()) {
+            for tail in ["", ".own", ".member"] {
+                names.insert(format!("worldguard.region.{sub}{tail}"));
+            }
+        }
+        for name in names {
+            let _ = event.nodes.add(perm_node(&name), NodeDefault::Level(PermissionLevel::from_level(2)));
+        }
+    }
+
     fn register_configs(&self, _: HostSide, event: &mut RegisterConfigsEvent<'_>) {
         event
             .configs
@@ -1423,16 +1474,16 @@ impl Hooks for Mod {
         }
     }
 
-    fn entity_interact(
-        &self,
-        host: &mut dyn ServerHost,
-        event: &mut EntityInteractEvent<'_>,
-    ) -> Flow {
+    // A cancel is answered as `InteractionResult::Fail` (the hook's own refusal; the old `Flow::Cancel`).
+    fn entity_interact(&self, host: HostSide, event: &mut EntityInteractEvent<'_>) -> Option<InteractionResult> {
+        let HostSide::Server(host) = host else {
+            return None;
+        };
         let Some(ap) = host.players().acting_player() else {
-            return Flow::Continue;
+            return None;
         };
         let Some(np) = snap(&*host, ap) else {
-            return Flow::Continue;
+            return None;
         };
         let at = host
             .entity(event.entity as u32)
@@ -1441,10 +1492,11 @@ impl Hooks for Mod {
         let st = lock(&self.st);
         let p = st.player(&np);
         match st.guard.interact_entity(&p, event.kind, at) {
-            Ok(()) => Flow::Continue,
+            Ok(()) => None,
             Err(d) => {
                 drop(st);
-                Self::denied(host, &p, &d.message)
+                let _ = Self::denied(host, &p, &d.message);
+                Some(InteractionResult::Fail)
             }
         }
     }
@@ -1575,7 +1627,7 @@ impl Hooks for Mod {
     }
 
     /// `item-drop`: a cancel puts the stack back.
-    fn item_toss(&self, host: &mut dyn ServerHost, event: &mut ItemTossEvent<'_>) -> Flow {
+    fn item_toss(&self, host: &mut dyn ServerHost, event: &mut ItemTossEvent) -> Flow {
         let uuid = event.player;
         self.player_check(host, uuid, |g, p| g.item_drop(p))
     }
@@ -1659,8 +1711,8 @@ impl Hooks for Mod {
         let root = command[..first_space].to_ascii_lowercase();
         let rest = &command[first_space + 1..];
         let words = match root.as_str() {
-            "rg" | "region" | "regions" => self.complete_region(&*host, event.player, rest),
-            "wg" | "worldguard" => self.complete_wg(&*host, event.player, rest),
+            "rg" | "region" | "regions" => self.complete_region(&mut *host, event.player, rest),
+            "wg" | "worldguard" => self.complete_wg(&mut *host, event.player, rest),
             _ => return,
         };
         let word_start = command.rfind(' ').map_or(0, |i| i + 1);
