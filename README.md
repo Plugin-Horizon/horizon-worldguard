@@ -42,7 +42,13 @@ This is a native trait mod: `horizon-mod.toml`, a `Cargo.toml` that depends on `
   notifications and game mode while walking.
 - Commands: `/rg define, redefine, claim, select, info, list, flags, flag, setpriority, setparent,
   remove, addmember, addowner, removemember, removeowner, teleport, load, save, bypass,
-  migrateheights`, with the documented aliases and options; `/wg reload|flushstates|running|version`.
+  migrateheights`, with the documented aliases and options; `/wg reload|flushstates|running|report|version`;
+  `/god`, `/ungod`, `/heal`, `/slay` (with `-s`, `*` and the `.other` nodes), `/stopfire`, `/allowfire`,
+  `/halt-activity` (`/stoplag`) and `/stack`.
+- Flags with their own handler: `block-trampling`, `crop-growth`, `moisture-change`, `lava-harden`,
+  `exp-drops`, `enderman-grief`, `snowman-trails`, `ravager-grief`, `wind-charge-burst`,
+  `natural-health-regen`, `natural-hunger-drain`, `heal-*`, `feed-*`, and `potion-splash` for lingering
+  clouds. `weather-lock` and `time-lock` are saved but have no effect (see Known gaps).
 
 Full list with what is partial: the Known gaps section. What Horizon lacks for the rest: the Known gaps section.
 
@@ -113,8 +119,8 @@ right; other players need the node (`worldguard.region.define`, `.claim`, `.list
 `.load`, `.save`, `.migrate*`, `.unlimited`, `.toggle-bypass`, and for one region
 `worldguard.region.<command>.<id>`, `.member.<id>` or `.own.<id>`, with `flag.regions` and
 `flag.flags.<flag>[.<value>]`) through Horizon's `has_permission` (a permissions mod answers it; without
-one only operators pass), or a subcommand listed in `player-commands`. Bypass nodes are not read yet
-(the Known gaps section).
+one only operators pass), or a subcommand listed in `player-commands`. `worldguard.region.bypass.<world>`
+is read once a second for every online player (default: operators), so a permission plugin can grant it.
 
 ## Build
 
@@ -128,10 +134,17 @@ horizon-launcher native-build <path to this folder> --server-output <dir> --vers
 
 ## Known gaps
 
-What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` in `src/lib.rs`):
+What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` or `HMOD-GAP(...)` in `src/`):
 
-- `/rg define`, `redefine`, `claim` and `select` report that there is no selection (no WorldEdit selection API on arismoko yet).
 - Colour codes are dropped (messages are plain), and titles go to the action bar.
-- Portal use, chorus-fruit and `/tp` teleports cannot be refused; a rescue teleport puts the player back on the next tick.
+- Portal use and `/tp` teleports cannot be refused; a rescue teleport puts the player back on the next tick.
 - The source entity of an explosion and the kind of a spreading fluid are not told: the nearest tracked explosive names the blast, water-flow and lava-flow apply to any fluid.
-- Farmland trampling and a vehicle leaving a region cannot be held back.
+- A vehicle leaving a region cannot be held back.
+- `weather-lock` and `time-lock` need a per-player weather and time (not on Horizon): the flags are saved, `/rg flag` warns.
+- `potion-splash` only stops lingering clouds: the splash hook cannot cancel or weaken a hit.
+- `natural-health-regen` cannot tell natural regeneration from other heals: any heal of one point or less is held back (a Regeneration effect too).
+- `lava-harden` acts on any fluid that places a block (cobblestone, stone, basalt, obsidian). `enderman-grief`, `snowman-trails` and `ravager-grief` look at the mob's own position, not the block it would change.
+- `/halt-activity` does not remove the entities that already exist. `/locate` (no compass target), `/wg profile`, `stopprofile` and `debug` (no profiler or event replay) are missing.
+- Region-scoped permission nodes (`worldguard.region.<sub>.<id>` and friends) cannot be declared at start; see HMOD_PORT.md.
+- `ice-melt`, `snow-melt`, `ice-form`, `mushroom-growth` and the other block fade/form/grow flags have rules in the guard but no hook feeds them yet (the fade, form and grow events give no block name without a host).
+- Blacklist, chest protection, sponge, per-world config files and SQL region storage are not ported.
