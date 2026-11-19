@@ -17,7 +17,7 @@ use mod_api::{
     RegisterConfigsEvent, RightClickBlockEvent, RunModCommandEvent, ServerChatEvent, ServerHost,
     ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Suggestion, TabCompleteEvent, Text, TntPrimedEvent,
     InteractionResult, NodeDefault, PermissionGatherNodesEvent, PermissionLevel, PermissionNode, PermissionValueType,
-    CropGrowPreEvent, EntityChangeBlockPreEvent, EntityMobGriefingEvent, ExpDropEvent, ExplosionStartEvent,
+    CropGrowPreEvent, EntityChangeBlockPreEvent, EntityMobGriefingEvent, ExplosionStartEvent,
     FluidPlaceBlockEvent, FoodLevelChangedEvent, Host, LivingExperienceDropEvent, LivingHealEvent, LoopContext,
     MoistureChangeEvent,
 };
@@ -1002,7 +1002,7 @@ impl Mod {
                 slot: *slot,
                 group,
                 count: stack.count(),
-                max: stack.item().max_stack_size(&*host).unwrap_or(64),
+                max: host.max_stack_size(stack.item()).unwrap_or(64),
             });
         }
         for (slot, count) in wg::stack::compact(&entries) {
@@ -1555,7 +1555,14 @@ impl Hooks for Mod {
         let st = lock(&self.st);
         let p = st.player(&np);
         match st.guard.break_block(&p, bp(event.pos)) {
-            Ok(()) => Flow::Continue,
+            Ok(()) => {
+                // `exp-drops`: the block part's `exp_drop` hook is per block, so the global `break_block`
+                // sample override stands in for it.
+                if !st.guard.exp_drops(&p.dimension, bp(event.pos)) {
+                    *event.exp_to_drop = Some(0);
+                }
+                Flow::Continue
+            }
             Err(d) => {
                 drop(st);
                 Self::denied(host, &p, &d.message)
@@ -1908,15 +1915,6 @@ impl Hooks for Mod {
         }
     }
 
-    /// `exp-drops` for a block's experience.
-    fn exp_drop(&self, _level: &dyn LevelHost, event: &mut ExpDropEvent<'_>) -> Option<i32> {
-        let at = bp_of([event.pos.x, event.pos.y, event.pos.z]);
-        if lock(&self.st).guard.exp_drops(&dim_id(&event.dimension), at) {
-            None
-        } else {
-            Some(0)
-        }
-    }
 
     /// `exp-drops` for the experience of a dying mob or player.
     fn living_experience_drop(
