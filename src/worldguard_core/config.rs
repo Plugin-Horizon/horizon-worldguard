@@ -74,8 +74,12 @@ exit-deny = "&c&lHey!&7 You are not permitted to leave this area."
 # World options (WorldGuard's per-world config.yml sections). Only the ones below are acted on:
 #   mobs.block-*-explosions / -block-damage, ignition.block-tnt / -block-damage,
 #   fire.disable-all-fire-spread, fire.disable-lava-fire-spread, dynamics.disable-* (ice, snow,
-#   leaf decay, growth, soil, coral, copper), player-damage.disable-fall-damage / -mob-damage /
-#   -explosion-damage.
+#   leaf decay, growth, soil, coral, copper, crop growth, soil moisture, lava harden),
+#   player-damage.disable-fall-damage / -mob-damage / -lava-damage / -fire-damage /
+#   -lightning-damage / -drowning-damage / -suffocation-damage / -contact-damage / -void-damage /
+#   -explosion-damage, crops.disable-player-trampling / -creature-trampling (also turtle-egg.* and
+#   sniffer-egg.*), mobs.disable-enderman-griefing / disable-snowman-trails,
+#   protection.disable-xp-orb-drops, default.disable-health-regain.
 # All default to false, except mobs.allow-tamed-spawns and mobs.block-plugin-spawning (true).
 [mobs]
 [ignition]
@@ -85,7 +89,7 @@ exit-deny = "&c&lHey!&7 You are not permitted to leave this area."
 "#;
 
 /// The sections of WorldGuard's per-world `config.yml` whose boolean keys are read.
-const RULE_SECTIONS: [&str; 15] = [
+const RULE_SECTIONS: [&str; 16] = [
     "mobs",
     "ignition",
     "fire",
@@ -101,6 +105,7 @@ const RULE_SECTIONS: [&str; 15] = [
     "default",
     "chest-protection",
     "event-handling",
+    "protection",
 ];
 
 /// Rule keys that are true unless the file says otherwise.

@@ -21,6 +21,8 @@ pub struct Player {
     pub yaw: f32,
     pub pitch: f32,
     pub game_mode: i32,
+    /// The player holds `worldguard.region.bypass.<world>` for the world they are in.
+    pub bypass_perm: bool,
 }
 
 impl Player {
@@ -80,7 +82,7 @@ impl Blast {
             Blast::Wither => "wither-damage",
             Blast::EnderDragon => "enderdragon-block-damage",
             Blast::BreezeCharge => "breeze-charge-explosion",
-            Blast::WindCharge => return None,
+            Blast::WindCharge => "wind-charge-burst",
             Blast::Other => "other-explosion",
         })
     }
@@ -109,6 +111,10 @@ pub struct Guard {
     pub worlds: BTreeMap<String, World>,
     /// Operators who switched bypass off (or on, with `disable-bypass-by-default`).
     pub bypass_toggled: HashSet<u128>,
+    /// Worlds where `/stopfire` is in force (all fire spread off until `/allowfire`).
+    pub fire_stopped: HashSet<String>,
+    /// `/halt-activity` is in force (items, XP orbs, falling blocks and the like do not spawn).
+    pub activity_halted: bool,
 }
 
 impl Guard {
@@ -141,7 +147,7 @@ impl Guard {
         if self.cfg.fake_player_build_override && is_fake_player(&p.subject.name) {
             return true;
         }
-        if !self.is_admin(p) {
+        if !self.is_admin(p) && !p.bypass_perm {
             return false;
         }
         let toggled = self.bypass_toggled.contains(&p.subject.uuid);
@@ -431,6 +437,11 @@ impl Guard {
         if by_mob && self.cfg.rule("player-damage.disable-mob-damage") {
             return false;
         }
+        if let Some(option) = damage_option(t)
+            && self.cfg.rule(option)
+        {
+            return false;
+        }
         if t == "firework" || t == "fireworks" {
             // Only an explicit deny stops it (the damage query is not a build query).
             let actor = attacker.map_or(Actor::Nobody, |a| Actor::Player(&a.subject));
@@ -448,6 +459,9 @@ impl Guard {
     }
 
     pub fn mob_spawn(&self, dimension: &str, kind: &str, at: [f64; 3]) -> bool {
+        if self.activity_halted && kinds::is_mob(kind) {
+            return false;
+        }
         if !self.cfg.enable || !self.cfg.use_creature_spawn_event || !kinds::is_mob(kind) {
             return true;
         }
@@ -511,8 +525,13 @@ impl Guard {
         }
     }
 
+    /// `/stopfire` is in force for the world of `dimension`.
+    fn fire_halted(&self, dimension: &str) -> bool {
+        self.fire_stopped.contains(&self.cfg.world_of(dimension))
+    }
+
     pub fn fire_spread(&self, dimension: &str, to: BlockPos) -> bool {
-        if self.cfg.rule("fire.disable-all-fire-spread") {
+        if self.activity_halted || self.fire_halted(dimension) || self.cfg.rule("fire.disable-all-fire-spread") {
             return false;
         }
         !self.cfg.high_frequency_flags || self.natural(dimension, to, "fire-spread")
@@ -534,6 +553,9 @@ impl Guard {
         } else if c.contains("lightning") {
             "lightning"
         } else {
+            if self.fire_halted(dimension) {
+                return Err(Denied { what: "light fires", message: String::new() });
+            }
             if !self.cfg.high_frequency_flags {
                 return Ok(());
             }
@@ -547,18 +569,21 @@ impl Guard {
     }
 
     pub fn burn(&self, dimension: &str, at: BlockPos) -> bool {
-        if self.cfg.rule("fire.disable-all-fire-spread") {
+        if self.activity_halted || self.fire_halted(dimension) || self.cfg.rule("fire.disable-all-fire-spread") {
             return false;
         }
         !self.cfg.high_frequency_flags || self.natural(dimension, at, "fire-spread")
     }
 
     pub fn leaf_decay(&self, dimension: &str, at: BlockPos) -> bool {
-        !self.cfg.rule("dynamics.disable-leaf-decay") && self.natural(dimension, at, "leaf-decay")
+        !self.activity_halted && !self.cfg.rule("dynamics.disable-leaf-decay") && self.natural(dimension, at, "leaf-decay")
     }
 
     /// A fluid flowing from `from` into `to`.
     pub fn fluid_flow(&self, dimension: &str, fluid: &str, from: BlockPos, to: BlockPos) -> bool {
+        if self.activity_halted {
+            return false;
+        }
         if !self.cfg.enable {
             return true;
         }
@@ -645,6 +670,97 @@ impl Guard {
         true
     }
 
+    // -- flags that act on one kind of event ------------------------------------------------
+
+    /// `block-trampling` for a player landing on farmland or an egg (`block` is the trampled
+    /// block). The world option comes first, as in WorldGuard; no message is sent.
+    pub fn trample_by_player(&self, p: &Player, at: BlockPos, block: &str) -> Outcome {
+        let option = match block.strip_prefix("minecraft:").unwrap_or(block) {
+            "farmland" => "crops.disable-player-trampling",
+            "turtle_egg" => "turtle-egg.disable-player-trampling",
+            "sniffer_egg" => "sniffer-egg.disable-player-trampling",
+            _ => "",
+        };
+        if !option.is_empty() && self.cfg.rule(option) {
+            return Err(Denied { what: "trample that block", message: String::new() });
+        }
+        self.build(p, at, &["block-trampling"], "trample that block")
+            .map_err(|d| Denied { message: String::new(), ..d })
+    }
+
+    /// The same for a mob (no player: the regions' non-member rules apply).
+    pub fn trample_by_mob(&self, dimension: &str, at: BlockPos, block: &str) -> bool {
+        let option = match block.strip_prefix("minecraft:").unwrap_or(block) {
+            "farmland" => "crops.disable-creature-trampling",
+            "turtle_egg" => "turtle-egg.disable-creature-trampling",
+            "sniffer_egg" => "sniffer-egg.disable-creature-trampling",
+            _ => "",
+        };
+        if !option.is_empty() && self.cfg.rule(option) {
+            return false;
+        }
+        if !self.cfg.enable {
+            return true;
+        }
+        self.world(dimension)
+            .is_none_or(|w| Query::new(w).can_build(at, &Actor::Nobody, &["block-trampling"]).allowed())
+    }
+
+    /// A crop about to grow at `at` (`crop-growth`).
+    pub fn crop_grows(&self, dimension: &str, at: BlockPos) -> bool {
+        !self.cfg.rule("dynamics.disable-crop-growth") && self.natural(dimension, at, "crop-growth")
+    }
+
+    /// Farmland about to change its moisture (`moisture-change`).
+    pub fn moisture_changes(&self, dimension: &str, at: BlockPos) -> bool {
+        !self.cfg.rule("dynamics.disable-soil-moisture-change") && self.natural(dimension, at, "moisture-change")
+    }
+
+    /// Lava about to harden (`lava-harden`).
+    pub fn lava_hardens(&self, dimension: &str, at: BlockPos) -> bool {
+        !self.cfg.rule("dynamics.disable-lava-harden") && self.natural(dimension, at, "lava-harden")
+    }
+
+    /// Experience about to drop at `at` (`exp-drops`).
+    pub fn exp_drops(&self, dimension: &str, at: BlockPos) -> bool {
+        !self.cfg.rule("protection.disable-xp-orb-drops") && self.natural(dimension, at, "exp-drops")
+    }
+
+    /// A lingering cloud (or dragon breath) about to appear at `at` (`potion-splash`).
+    pub fn cloud_spawns(&self, dimension: &str, at: BlockPos) -> bool {
+        self.natural(dimension, at, "potion-splash")
+    }
+
+    /// A wind charge bursting at `at` may push what stands there (`wind-charge-burst`).
+    pub fn wind_burst_pushes(&self, dimension: &str, at: BlockPos) -> bool {
+        self.natural(dimension, at, "wind-charge-burst")
+    }
+
+    /// A mob of `kind` about to change a block at `at` (`enderman-grief`, `snowman-trails`,
+    /// `ravager-grief`, and the two world options). Other kinds always may.
+    pub fn mob_may_grief(&self, dimension: &str, kind: &str, at: BlockPos) -> bool {
+        let (flag, option) = match kind.strip_prefix("minecraft:").unwrap_or(kind) {
+            "enderman" => ("enderman-grief", "mobs.disable-enderman-griefing"),
+            "snow_golem" => ("snowman-trails", "mobs.disable-snowman-trails"),
+            "ravager" => ("ravager-grief", ""),
+            _ => return true,
+        };
+        !(!option.is_empty() && self.cfg.rule(option)) && self.natural(dimension, at, flag)
+    }
+
+    /// Natural health regeneration for `p` (`natural-health-regen`, `default.disable-health-regain`).
+    pub fn natural_regen(&self, p: &Player) -> bool {
+        if self.cfg.rule("default.disable-health-regain") {
+            return false;
+        }
+        self.state_plain(p, p.block(), "natural-health-regen", "").is_ok()
+    }
+
+    /// Hunger draining from `p` (`natural-hunger-drain`).
+    pub fn natural_hunger(&self, p: &Player) -> bool {
+        self.state_plain(p, p.block(), "natural-hunger-drain", "").is_ok()
+    }
+
     // -- players ---------------------------------------------------------------------------
 
     pub fn item_pickup(&self, p: &Player) -> Outcome {
@@ -727,6 +843,21 @@ impl Guard {
     }
 }
 
+/// The `player-damage.*` world option that switches off damage of a vanilla damage type.
+pub fn damage_option(damage_type: &str) -> Option<&'static str> {
+    Some(match damage_type {
+        "lava" => "player-damage.disable-lava-damage",
+        "in_fire" | "on_fire" => "player-damage.disable-fire-damage",
+        "lightning_bolt" => "player-damage.disable-lightning-damage",
+        "drown" => "player-damage.disable-drowning-damage",
+        "in_wall" => "player-damage.disable-suffocation-damage",
+        "cactus" | "sweet_berry_bush" => "player-damage.disable-contact-damage",
+        "out_of_world" => "player-damage.disable-void-damage",
+        "explosion" | "player_explosion" => "player-damage.disable-explosion-damage",
+        _ => return None,
+    })
+}
+
 /// WorldGuard's `CommandFilter.apply`: whether `command` may run. A rule matches when its words
 /// are the first words of the command; a matching `permitted` rule beats a matching `denied` one,
 /// and when `permitted` has rules the command must match one of them.
@@ -776,6 +907,7 @@ mod tests {
             yaw: 0.0,
             pitch: 0.0,
             game_mode: 0,
+            bypass_perm: false,
         }
     }
 
@@ -886,6 +1018,94 @@ mod tests {
         assert_eq!(d.message, "\u{a7}c\u{a7}lHey!\u{a7}7 Sorry, but you can't drop items here.");
         assert!(g.item_drop(&outside).is_ok());
         assert!(g.item_drop(&op).is_ok(), "bypass");
+    }
+
+    #[test]
+    fn flags_that_name_one_event() {
+        let mut g = lobby_guard();
+        let lobby = g.world_mut("minecraft:overworld").get_mut("lobby").unwrap();
+        for f in [
+            "block-trampling",
+            "crop-growth",
+            "moisture-change",
+            "lava-harden",
+            "exp-drops",
+            "enderman-grief",
+            "snowman-trails",
+            "ravager-grief",
+            "potion-splash",
+            "wind-charge-burst",
+            "natural-health-regen",
+            "natural-hunger-drain",
+        ] {
+            lobby.set_flag(f, Some(FlagValue::State(false)));
+        }
+        let d = "minecraft:overworld";
+        let (inside, outside) = (BlockPos::new(0, 63, 0), BlockPos::new(100, 63, 100));
+        assert!(!g.crop_grows(d, inside) && g.crop_grows(d, outside));
+        assert!(!g.moisture_changes(d, inside) && g.moisture_changes(d, outside));
+        assert!(!g.lava_hardens(d, inside) && g.lava_hardens(d, outside));
+        assert!(!g.exp_drops(d, inside) && g.exp_drops(d, outside));
+        assert!(!g.cloud_spawns(d, inside) && g.cloud_spawns(d, outside));
+        assert!(!g.wind_burst_pushes(d, inside) && g.wind_burst_pushes(d, outside));
+        for kind in ["minecraft:enderman", "snow_golem", "minecraft:ravager"] {
+            assert!(!g.mob_may_grief(d, kind, inside), "{kind} inside");
+            assert!(g.mob_may_grief(d, kind, outside), "{kind} outside");
+        }
+        assert!(g.mob_may_grief(d, "minecraft:zombie", inside));
+        let guest = player(1, 0, [0.5, 64.0, 0.5]);
+        let away = player(1, 0, [100.5, 64.0, 0.5]);
+        assert!(!g.natural_regen(&guest) && g.natural_regen(&away));
+        assert!(!g.natural_hunger(&guest) && g.natural_hunger(&away));
+        let err = g.trample_by_player(&guest, inside, "minecraft:farmland").unwrap_err();
+        assert_eq!(err.message, "");
+        assert!(g.trample_by_player(&guest, outside, "minecraft:farmland").is_ok());
+        assert!(g.trample_by_player(&player(3, 4, [0.5, 64.0, 0.5]), inside, "minecraft:farmland").is_ok());
+        assert!(!g.trample_by_mob(d, inside, "minecraft:farmland") && g.trample_by_mob(d, outside, "minecraft:farmland"));
+    }
+
+    #[test]
+    fn world_options_for_the_same_events() {
+        let mut g = Guard::new(
+            Config::parse(
+                "[crops]\ndisable-player-trampling = true\n[dynamics]\ndisable-crop-growth = true\n\
+                 [protection]\ndisable-xp-orb-drops = true\n[mobs]\ndisable-enderman-griefing = true\n\
+                 [default]\ndisable-health-regain = true\n[player-damage]\ndisable-lava-damage = true\n",
+            )
+            .unwrap(),
+        );
+        let d = "minecraft:overworld";
+        let at = BlockPos::new(100, 63, 100);
+        g.world_mut(d);
+        assert!(g.trample_by_player(&player(1, 0, [0.5, 64.0, 0.5]), at, "farmland").is_err());
+        assert!(g.trample_by_player(&player(1, 0, [0.5, 64.0, 0.5]), at, "minecraft:turtle_egg").is_ok());
+        assert!(!g.crop_grows(d, at));
+        assert!(!g.exp_drops(d, at));
+        assert!(!g.mob_may_grief(d, "minecraft:enderman", at));
+        assert!(g.mob_may_grief(d, "minecraft:snow_golem", at));
+        assert!(!g.natural_regen(&player(1, 0, [0.5, 64.0, 0.5])));
+        let p = player(1, 0, [0.5, 64.0, 0.5]);
+        assert!(!g.damage_player(&p, "minecraft:lava", None, false));
+        assert!(g.damage_player(&p, "minecraft:in_fire", None, false));
+        assert_eq!(damage_option("drown"), Some("player-damage.disable-drowning-damage"));
+        assert_eq!(damage_option("magic"), None);
+    }
+
+    #[test]
+    fn stopfire_and_halted_activity() {
+        let mut g = Guard::new(Config::default());
+        let (d, at) = ("minecraft:overworld", BlockPos::new(1, 64, 1));
+        assert!(g.fire_spread(d, at) && g.burn(d, at) && g.leaf_decay(d, at));
+        g.fire_stopped.insert("world".into());
+        assert!(!g.fire_spread(d, at) && !g.burn(d, at));
+        assert!(g.leaf_decay(d, at));
+        assert!(g.fire_spread("minecraft:the_nether", at), "another world");
+        assert!(g.ignite(None, d, at, "spread").is_err());
+        g.fire_stopped.clear();
+        g.activity_halted = true;
+        assert!(!g.leaf_decay(d, at) && !g.burn(d, at));
+        assert!(!g.mob_spawn(d, "minecraft:zombie", [1.0, 64.0, 1.0]));
+        assert!(g.mob_spawn(d, "minecraft:item", [1.0, 64.0, 1.0]));
     }
 
     #[test]
