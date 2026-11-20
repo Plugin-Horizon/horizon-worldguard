@@ -606,6 +606,7 @@ impl Mod {
         }
         let mut st = lock(&self.st);
         let world = st.guard.cfg.world_of(&p.dimension);
+        let data_dir = st.data_dir.clone();
         let now_ms = st.ticks * 1000 / TPS;
         let State { blacklists, guard, by_uuid, tells, commands, .. } = &mut *st;
         let Some(bl) = blacklists.get_mut(&world) else {
@@ -633,6 +634,19 @@ impl Mod {
         for l in &verdict.log {
             if log_console {
                 eprintln!("[worldguard] {l}");
+            }
+        }
+        // `blacklist.logging.file.enable`: the same lines, into the daily file of the world's pattern.
+        if guard.rule(&p.dimension, "blacklist.logging.file.enable") {
+            if let Some(dir) = &data_dir {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                for l in &verdict.log {
+                    if let Some(path) = wg::blacklist::log_file_path(wg::blacklist::LOG_FILE_PATTERN, &world, Some(&p.subject.name), now) {
+                        append_log_line(&dir.join(path), &wg::blacklist::log_file_line(&p.subject.name, l, now));
+                    }
+                }
             }
         }
         for n in &verdict.notify {
@@ -761,8 +775,8 @@ impl Mod {
             }
             "running" | "queue" => vec!["&dThere are currently no running tasks.".into()],
             "" | "version" => vec![
-                // The Java plugin's version (plugin.yml), not this port's crate version.
-                "&dWorldGuard 7.0.20+2410-0b6c3f1".to_owned(),
+                // The Java plugin's version (gradle.properties of the WorldGuard source this port follows).
+                "&dWorldGuard 7.0.22-SNAPSHOT".to_owned(),
                 "&dhttp://www.enginehub.org".to_owned(),
                 "&7----------- Platforms -----------".to_owned(),
                 "&7* Horizon".to_owned(),
@@ -1168,6 +1182,19 @@ impl Mod {
             let _ = s.player.set_inventory_slot(&mut *host, slot, replacement);
         }
         vec!["&dItems compacted into stacks!".to_owned()]
+    }
+}
+
+/// Appends one line to a blacklist log file, creating its folder (`FileHandler.log`). A failed write goes to the
+/// console and is otherwise ignored, as the original does.
+fn append_log_line(path: &Path, line: &str) {
+    use std::io::Write;
+    let res = path.parent().map_or(Ok(()), |dir| std::fs::create_dir_all(dir)).and_then(|()| {
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        file.write_all(line.as_bytes())
+    });
+    if let Err(e) = res {
+        eprintln!("[worldguard] Could not write the blacklist log: {e}");
     }
 }
 

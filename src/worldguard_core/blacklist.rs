@@ -332,6 +332,184 @@ impl Blacklist {
     }
 }
 
+/// The file log of the blacklist (`blacklist.logging.file.enable`): WorldGuard's default path pattern. The
+/// `path` and `open-files` options are not read yet (text options are not kept by the config), so this is the
+/// pattern every world uses.
+pub const LOG_FILE_PATTERN: &str = "worldguard/logs/%Y-%m-%d.log";
+
+/// The parts of a Unix time WorldGuard's `%` codes read, in UTC (Java uses the server's local time zone).
+#[derive(Debug, PartialEq)]
+pub struct Stamp {
+    pub year: i64,
+    /// 0 for January (`Calendar.MONTH`, which is what the original file names print).
+    pub month0: u32,
+    pub day: u32,
+    pub hour: u32,
+    pub minute: u32,
+    pub second: u32,
+    /// `Calendar.WEEK_OF_YEAR` with weeks starting on Sunday and week 1 holding January 1st.
+    pub week: u32,
+}
+
+/// Days since 1970-01-01 of a civil date (Howard Hinnant's algorithm, proleptic Gregorian).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The UTC stamp of a Unix time in seconds.
+pub fn stamp(unix_secs: u64) -> Stamp {
+    let days = (unix_secs / 86_400) as i64;
+    let secs = unix_secs % 86_400;
+    // Civil date of `days` (inverse of `days_from_civil`).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // 1..=12
+    let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
+    let jan1 = days_from_civil(year, 1, 1);
+    let doy0 = days - jan1;
+    // 1970-01-01 was a Thursday (Sunday = 0).
+    let jan1_weekday = (jan1 + 4).rem_euclid(7);
+    Stamp {
+        year,
+        month0: (month - 1) as u32,
+        day,
+        hour: (secs / 3600) as u32,
+        minute: ((secs % 3600) / 60) as u32,
+        second: (secs % 60) as u32,
+        week: ((doy0 + jan1_weekday) / 7 + 1) as u32,
+    }
+}
+
+/// A name in a log path: lower case, anything but `A-Z a-z 0-9 _` becomes `_`, at most 32 characters.
+fn path_name(text: &str) -> String {
+    text.to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .take(32)
+        .collect()
+}
+
+/// Fills a log path pattern like WorldGuard's `FileHandler.buildPath`. `%u` needs the player's name: without
+/// one there is no path (`None`). An unknown `%x` code is written as `?`, as the original does.
+pub fn log_file_path(pattern: &str, world: &str, player: Option<&str>, unix_secs: u64) -> Option<String> {
+    let s = stamp(unix_secs);
+    let mut out = String::new();
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        let Some(code) = chars.next() else {
+            out.push('%');
+            break;
+        };
+        let rep = match code {
+            '%' => "%".to_owned(),
+            'u' => path_name(player?),
+            'w' => path_name(world),
+            'Y' => s.year.to_string(),
+            'm' => format!("{:02}", s.month0),
+            'd' => format!("{:02}", s.day),
+            'W' => format!("{:02}", s.week),
+            'H' => format!("{:02}", s.hour),
+            'h' => format!("{:02}", s.hour % 12),
+            'i' => format!("{:02}", s.minute),
+            's' => format!("{:02}", s.second),
+            _ => "?".to_owned(),
+        };
+        out.push_str(&rep);
+    }
+    Some(out)
+}
+
+/// One line of the file log, as `FileHandler.log` writes it: `[yyyy-MM-dd HH:mm:ss] <name>: <message>`, CRLF.
+pub fn log_file_line(player: &str, message: &str, unix_secs: u64) -> String {
+    let s = stamp(unix_secs);
+    format!(
+        "[{}-{:02}-{:02} {:02}:{:02}:{:02}] {player}: {message}\r\n",
+        s.year,
+        s.month0 + 1,
+        s.day,
+        s.hour,
+        s.minute,
+        s.second
+    )
+}
+
+#[cfg(test)]
+mod file_log_tests {
+    use super::*;
+
+    #[test]
+    fn stamp_of_the_epoch() {
+        // 1970-01-01 is a Thursday: week 1, month code 0.
+        assert_eq!(
+            stamp(0),
+            Stamp { year: 1970, month0: 0, day: 1, hour: 0, minute: 0, second: 0, week: 1 }
+        );
+    }
+
+    #[test]
+    fn stamp_of_a_known_time() {
+        // 1700000000 = 2023-11-14 22:13:20 UTC; Sunday-based week 46.
+        assert_eq!(
+            stamp(1_700_000_000),
+            Stamp { year: 2023, month0: 10, day: 14, hour: 22, minute: 13, second: 20, week: 46 }
+        );
+    }
+
+    #[test]
+    fn default_pattern_fills_the_date() {
+        assert_eq!(
+            log_file_path(LOG_FILE_PATTERN, "world", None, 1_700_000_000).as_deref(),
+            Some("worldguard/logs/2023-10-14.log")
+        );
+    }
+
+    #[test]
+    fn world_and_player_names_are_cleaned() {
+        assert_eq!(
+            log_file_path("%w/%u.log", "World-Nether", Some("Ab.c"), 0).as_deref(),
+            Some("world_nether/ab_c.log")
+        );
+        assert_eq!(log_file_path("%w/%u.log", "world", None, 0), None);
+    }
+
+    #[test]
+    fn unknown_code_and_percent_escapes() {
+        assert_eq!(log_file_path("a%Qb%%c", "w", None, 0).as_deref(), Some("a?b%c"));
+        assert_eq!(log_file_path("end%", "w", None, 0).as_deref(), Some("end%"));
+    }
+
+    #[test]
+    fn time_codes_follow_calendar_fields() {
+        assert_eq!(
+            log_file_path("%Y %m %d %H %h %i %s %W", "w", None, 1_700_000_000).as_deref(),
+            Some("2023 10 14 22 10 13 20 46")
+        );
+    }
+
+    #[test]
+    fn file_line_format() {
+        assert_eq!(
+            log_file_line("Ab", "Break stone", 1_700_000_000),
+            "[2023-11-14 22:13:20] Ab: Break stone\r\n"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
