@@ -1,5 +1,9 @@
 # horizon-worldguard
 
+## Port status
+
+Compared with WorldGuard 7.0.22-SNAPSHOT (59e136a) (estimate): **72 %** of the original's commands, permissions, config keys, messages and features work today; **72 %** once our open Horizon PRs are merged; **73 %** with the engine changes we are writing; **72 %** with the newest Horizon SDK. Estimated count: 323/450 items. Status: not yet compiled after the 2026-11-20 round.
+
 > **Unofficial Rust port of WorldGuard for the Horizon server (https://github.com/arismoko/horizon). Not affiliated with or endorsed by the WorldGuard authors.**
 
 Region protection for [Horizon](https://github.com/arismoko/horizon) dedicated servers, as a
