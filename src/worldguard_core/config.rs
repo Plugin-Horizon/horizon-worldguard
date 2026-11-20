@@ -79,17 +79,36 @@ exit-deny = "&c&lHey!&7 You are not permitted to leave this area."
 #   -lightning-damage / -drowning-damage / -suffocation-damage / -contact-damage / -void-damage /
 #   -explosion-damage, crops.disable-player-trampling / -creature-trampling (also turtle-egg.* and
 #   sniffer-egg.*), mobs.disable-enderman-griefing / disable-snowman-trails,
-#   protection.disable-xp-orb-drops, default.disable-health-regain.
-# All default to false, except mobs.allow-tamed-spawns and mobs.block-plugin-spawning (true).
+#   protection.disable-xp-orb-drops, default.disable-health-regain, weather.disable-weather /
+#   disable-thunderstorm / always-raining / always-thundering / disable-lightning-strike-fire /
+#   disable-pig-zombification / disable-villager-witchification / disable-powered-creepers /
+#   prevent-lightning-strike-blocks, physics.disable-water-damage-blocks, fire.disable-fire-spread-blocks /
+#   lava-spread-blocks, dynamics.snow-fall-blocks, mobs.block-creature-spawn / block-above-ground-slimes /
+#   block-painting-destroy / block-item-frame-destroy / block-armor-stand-destroy / block-vehicle-entry /
+#   block-zombie-door-destruction / block-other-explosions / block-windcharge-explosions,
+#   player-damage.teleport-on-void-falling / reset-fall-on-void-teleport / teleport-on-suffocation /
+#   disable-death-messages, simulation.sponge.*, chest-protection.*, and the blacklist
+#   (`blacklist.use-as-whitelist`, `blacklist.logging.console.enable`; the rules are in each world's
+#   `blacklist.txt`).
+# A world's own `<data-folder>/worlds/<world>/config.yml` (WorldGuard's layout) overrides these for
+# that world.
+# All default to false, except mobs.allow-tamed-spawns, mobs.block-plugin-spawning,
+# chest-protection.disable-off-check, blacklist.logging.console.enable (true).
 [mobs]
 [ignition]
 [fire]
 [dynamics]
 [player-damage]
+[physics]
+[weather]
+[simulation.sponge]
+[chest-protection]
+[blacklist]
 "#;
 
 /// The sections of WorldGuard's per-world `config.yml` whose boolean keys are read.
-const RULE_SECTIONS: [&str; 16] = [
+const RULE_SECTIONS: [&str; 17] = [
+    "blacklist",
     "mobs",
     "ignition",
     "fire",
@@ -109,12 +128,22 @@ const RULE_SECTIONS: [&str; 16] = [
 ];
 
 /// Rule keys that are true unless the file says otherwise.
-const RULE_DEFAULT_TRUE: [&str; 4] = [
+const RULE_DEFAULT_TRUE: [&str; 5] = [
+    "blacklist.logging.console.enable",
     "mobs.allow-tamed-spawns",
     "mobs.block-plugin-spawning",
     "chest-protection.disable-off-check",
     "event-handling.break-hoppers-on-denied-move",
 ];
+
+/// The options one world's own `config.yml` sets (`<data-folder>/worlds/<world>/config.yml`); they
+/// win over `config/worldguard-common.toml`, which holds the defaults for every world.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WorldRules {
+    pub rules: BTreeMap<String, bool>,
+    pub lists: BTreeMap<String, Vec<String>>,
+    pub ints: BTreeMap<String, i64>,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
@@ -153,6 +182,13 @@ pub struct Config {
     pub exit_deny_message: String,
     /// `section.key` -> value of the world options in `RULE_SECTIONS`.
     pub rules: BTreeMap<String, bool>,
+    /// `section.key` -> list of strings (`physics.disable-water-damage-blocks`,
+    /// `mobs.block-creature-spawn`, ...), lower case.
+    pub lists: BTreeMap<String, Vec<String>>,
+    /// `section.key` -> number (`simulation.sponge.radius`).
+    pub ints: BTreeMap<String, i64>,
+    /// World folder name -> that world's own options.
+    pub world_rules: BTreeMap<String, WorldRules>,
 }
 
 impl Default for Config {
@@ -165,6 +201,69 @@ impl Config {
     /// A world option (`mobs.block-creeper-explosions`), with WorldGuard's default.
     pub fn rule(&self, key: &str) -> bool {
         self.rules.get(key).copied().unwrap_or_else(|| RULE_DEFAULT_TRUE.contains(&key))
+    }
+
+    /// A world option for the world folder `world`: its own `config.yml` first, then the common
+    /// file, then WorldGuard's default.
+    pub fn rule_in(&self, world: &str, key: &str) -> bool {
+        self.world_rules
+            .get(world)
+            .and_then(|w| w.rules.get(key))
+            .copied()
+            .unwrap_or_else(|| self.rule(key))
+    }
+
+    /// A list option for the world folder `world` (empty when set nowhere).
+    pub fn list_in(&self, world: &str, key: &str) -> &[String] {
+        self.world_rules
+            .get(world)
+            .and_then(|w| w.lists.get(key))
+            .or_else(|| self.lists.get(key))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// A number option for the world folder `world`.
+    pub fn int_in(&self, world: &str, key: &str, default: i64) -> i64 {
+        self.world_rules
+            .get(world)
+            .and_then(|w| w.ints.get(key))
+            .or_else(|| self.ints.get(key))
+            .copied()
+            .unwrap_or(default)
+    }
+
+    /// Reads a world's own `config.yml` (WorldGuard's layout: the same sections as the common
+    /// file). Every boolean, number and list of text below any key is kept under its dotted
+    /// path; a text that is not valid YAML leaves the old options in place.
+    pub fn set_world_yaml(&mut self, world: &str, text: &str) -> Result<(), String> {
+        fn walk(prefix: &str, v: &super::yaml::Value, out: &mut WorldRules) {
+            use super::yaml::Value;
+            match v {
+                Value::Map(entries) => {
+                    for (k, v) in entries {
+                        let key = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+                        walk(&key, v, out);
+                    }
+                }
+                Value::Bool(b) => {
+                    out.rules.insert(prefix.to_owned(), *b);
+                }
+                Value::Int(n) => {
+                    out.ints.insert(prefix.to_owned(), *n);
+                }
+                Value::List(items) => {
+                    let list = items.iter().filter_map(Value::to_text).map(|t| t.to_ascii_lowercase()).collect();
+                    out.lists.insert(prefix.to_owned(), list);
+                }
+                _ => {}
+            }
+        }
+        let root = super::yaml::parse(text).map_err(|e| e.to_string())?;
+        let mut rules = WorldRules::default();
+        walk("", &root, &mut rules);
+        self.world_rules.insert(world.to_owned(), rules);
+        Ok(())
     }
 
     /// `getMaxRegionCount(player)`: the largest limit among the player's groups, else the default.
@@ -226,13 +325,37 @@ impl Config {
             _ => {}
         }
         let mut rules = BTreeMap::new();
-        for section in RULE_SECTIONS {
-            if let Some(tab) = t.get(section).and_then(|v| v.as_table()) {
-                for (k, v) in tab {
-                    if let Some(b) = v.as_bool() {
-                        rules.insert(format!("{section}.{k}"), b);
+        let mut lists = BTreeMap::new();
+        let mut ints = BTreeMap::new();
+        fn collect(
+            prefix: &str,
+            v: &toml::Value,
+            rules: &mut BTreeMap<String, bool>,
+            lists: &mut BTreeMap<String, Vec<String>>,
+            ints: &mut BTreeMap<String, i64>,
+        ) {
+            match v {
+                toml::Value::Table(tab) => {
+                    for (k, v) in tab {
+                        collect(&format!("{prefix}.{k}"), v, rules, lists, ints);
                     }
                 }
+                toml::Value::Boolean(b) => {
+                    rules.insert(prefix.to_owned(), *b);
+                }
+                toml::Value::Integer(n) => {
+                    ints.insert(prefix.to_owned(), *n);
+                }
+                toml::Value::Array(a) => {
+                    let list = a.iter().filter_map(|x| x.as_str().map(str::to_ascii_lowercase)).collect();
+                    lists.insert(prefix.to_owned(), list);
+                }
+                _ => {}
+            }
+        }
+        for section in RULE_SECTIONS {
+            if let Some(v) = t.get(section) {
+                collect(section, v, &mut rules, &mut lists, &mut ints);
             }
         }
         let cfg = Config {
@@ -292,6 +415,9 @@ impl Config {
                 super::flags::DEFAULT_EXIT_DENY_MESSAGE,
             ),
             rules,
+            lists,
+            ints,
+            world_rules: BTreeMap::new(),
         };
         Ok(cfg)
     }

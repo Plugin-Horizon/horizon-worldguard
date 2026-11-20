@@ -1,4 +1,6 @@
 # hmod port: worldguard
+Parity: before 60% -> after 71% (about 321/450 items; method: commands, permission nodes, config keys, flags and listed features of WorldGuard 7.0.22 counted against the original, ~51 items closed in round 3, items blocked by a missing engine API count as not done)
+
 Round 1
 - Fixed: `entity_interact` takes `HostSide` and returns `Option<InteractionResult>`; a denial is `InteractionResult::Fail` (src/lib.rs).
 - Fixed: `item_toss` event type has no lifetime parameter (`ItemTossEvent`) (src/lib.rs).
@@ -28,3 +30,27 @@ Round 2 (parity fixes)
   - HMOD-GAP(halt_entities): `/halt-activity` cannot list the loaded entities to remove them.
   - HMOD-GAP(compass_target) `/locate`; HMOD-GAP(profiler) `/wg profile|stopprofile|debug`.
 - Unsure: `PlayerRef::food`, `set_food_level`, `set_saturation`, `set_exhaustion`, `inventory_slots`, `set_inventory_slot`, `ItemKey::max_stack_size` and `BlockState::block().id(host)` are used by the naming convention of the generated handle methods, not checked against a build.
+
+Round 3 (100 % round, written blind: nothing compiled or run)
+- Added: per-world config files. `<data-folder>/worlds/<world>/config.yml` (WorldGuard's layout, any section of `config/worldguard-common.toml`) overrides the common file for that world; read with the regions at start and on `/wg reload` and `/rg load`. `Config::rule_in|list_in|int_in`, `Config::set_world_yaml` (`config.rs`), `Guard::rule(dimension, key)` (every world option in `guard.rs` now reads through it).
+- Added: world options with a list or number value: `mobs.block-creature-spawn`, `physics.disable-water-damage-blocks`, `fire.disable-fire-spread-blocks`, `fire.lava-spread-blocks`, `dynamics.snow-fall-blocks`, `weather.prevent-lightning-strike-blocks`, `simulation.sponge.radius` (`Config::lists`/`ints`; nested tables of the common file are flattened to dotted keys).
+- Added: weather rules. `weather.disable-weather|disable-thunderstorm|always-raining|always-thundering` (`weather_change`, the last allowed state per dimension is kept to tell what changed), `disable-lightning-strike-fire` (`Guard::ignite`), `prevent-lightning-strike-blocks` and the `lightning` flag (a lightning bolt joining the level), `disable-pig-zombification|villager-witchification|powered-creepers` (`entity_struck_by_lightning`: a cancel also spares the animal the bolt's damage).
+- Added: mob rules. `mobs.block-above-ground-slimes` (slimes from y 60 up), `block-painting-destroy`, `block-item-frame-destroy` (breaks without a player), `block-armor-stand-destroy`, `block-vehicle-entry`.
+- Added: physics and fire. `physics.disable-water-damage-blocks` and `fire.lava-spread-blocks` in `block_spread`; the fluid is now told from the block it flows out of, so `water-flow` and `lava-flow` apply to their own fluid (closes that Known gap). `fire.disable-fire-spread-blocks` (neighbours of the new fire, and burning of those blocks), `ignition.block-lighter` (operators stand in for `worldguard.override.lighter`).
+- Added: `player-damage.teleport-on-void-falling` and `teleport-on-suffocation`: the damage is cancelled and the player is moved to where they were 3-4 seconds earlier (one sample a second). `reset-fall-on-void-teleport` is read but a teleport is the only reset (see gaps).
+- Added: hooks for the block flags: `block_fade` (`ice-melt`, `snow-melt`, `soil-dry`, `coral-fade`, `copper-fade`, the matching `dynamics.*` options), `block_form` (`ice-form`, `snow-fall`, `frosted-ice-form`), `block_grow_feature` (`mushroom-growth`).
+- Added: blacklist (`worldguard_core/blacklist.rs`). `worlds/<world>/blacklist.txt` in WorldGuard's format (`[a,b]` headings, `on-break|on-place|on-interact|on-destroy-with|on-acquire|on-drop|on-use=deny,allow,tell,notify,log,kick,ban`, `message`, `comment`, `ignore-groups`, `ignore-perms`), whitelist mode (`blacklist.use-as-whitelist`), the 3 s repeat guard, console logging (`blacklist.logging.console.enable`). Wired to `break_block`, `entity_place`, `right_click_block`, `item_toss`, `item_picked_up` (silent).
+- Added: sign chest protection (`worldguard_core/chest.rs`, `chest_world.rs`): `[Lock]` signs, break/use/place/explosion protection, the `sign_changed` rules and `chest-protection.disable-off-check`. Nodes `worldguard.chest-protection.override` and `worldguard.override.chest-protection`.
+- Added: sponges (`simulation.sponge.*`): water does not flow into a sponge's reach; a placed sponge clears the water around it at the next tick (`fill ... replace water`).
+- Permission nodes: `worldguard.notify`, `worldguard.chest-protection.override`, `worldguard.override.chest-protection`, `worldguard.override.lighter` -> level 2, `permission_gather_nodes`.
+- Gaps (all in GAPS_UPSTREAM.md):
+  - HMOD-GAP(block_physics): `physics.no-physics-sand|gravel`, `physics.allow-portal-anywhere`, `physics.vine-like-rope-ladders` need a cancellable block physics hook.
+  - HMOD-GAP(zombie_door): `mobs.block-zombie-door-destruction` (`entity_break_door` is listen-only), `mobs.block-enderdragon-portal-creation` (`portal_create` is listen-only), `mobs.anti-wolf-dumbness` (no tamed read).
+  - HMOD-GAP(growth_hooks): `grass-growth`, `mycelium-spread`, `vine-growth`, `rock-growth`, `sculk-growth` have no hook (`block_spread` only names fluid and fire).
+  - HMOD-GAP(blacklist_equip_dispense): `on-equip` and `on-dispense` need the item of an equip and a dispenser's stack; `blacklist.logging.file|database` are not written; `ignore-groups` needs the player's groups (none are read).
+  - HMOD-GAP(death_message): `player-damage.disable-death-messages`, `default.pumpkin-scuba`, `gameplay.disable-conduit-effects`, `protection.item-durability`, `protection.remove-infinite-stacks`, `gameplay.block-potions` have no hook that can change them.
+  - HMOD-GAP(void_spawn): `teleport-on-void-falling` and `teleport-on-suffocation` use the recent trail of the player, not the world spawn or a computed free position; the fall distance cannot be reset.
+  - HMOD-GAP(damage_dimension): `LivingIncomingDamageEvent` and `HangingBreakEvent` name no dimension, so `mobs.block-armor-stand-destroy`, `block-painting-destroy` and `block-item-frame-destroy` read the overworld's options.
+  - HMOD-GAP(redstone_sponge): a redstone-powered sponge's toggling is not simulated (only absorption by placement and flow).
+- Unsure: `LevelHost::state_block`, `has_neighbor_signal`, `HostReader` (`block_entity` + `entity.data` as the chest shop mod reads sign text), the `EntityStruckByLightningEvent`/`EntityJoinLevelEvent` handles and `Hand::Main` on `hand_item` follow the generated reference and other mods; `weather_change`'s `raining`/`thundering` are taken as the new state, and the dimension string as `minecraft:overworld`.
+- Not applicable: `iconomy.*`, `summary-on-start`, `custom-metrics-charts`, `regions.use-paper-entity-origin`, `event-handling.*` (Bukkit event plumbing), SQL region storage.

@@ -109,7 +109,8 @@ deny = "&c&lHey!&7 Sorry, but you can't %what% here."
 entry-deny = "&c&lHey!&7 You are not permitted to enter this area."
 exit-deny = "&c&lHey!&7 You are not permitted to leave this area."
 
-[mobs]                           # WorldGuard's per-world sections, merged into this file:
+[mobs]                           # WorldGuard's per-world sections, merged into this file (a world's own
+                                 # worlds/<world>/config.yml overrides them for that world):
 block-creeper-explosions = false # the mobs, ignition, fire, dynamics and player-damage keys that
                                  # have a handler (see config.rs), all false by default
 ```
@@ -138,8 +139,9 @@ What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: .
 
 - Colour codes are dropped (messages are plain), and titles go to the action bar.
 - Portal use and `/tp` teleports cannot be refused; a rescue teleport puts the player back on the next tick.
-- The source entity of an explosion and the kind of a spreading fluid are not told: the nearest tracked explosive names the blast, water-flow and lava-flow apply to any fluid.
+- The source entity of an explosion is not told: the nearest tracked explosive names the blast.
 - A vehicle leaving a region cannot be held back.
+- Round 3 additions are written blind (not built, not run): world options for weather, mobs, physics, fire, sponges, the blacklist (`worlds/<world>/blacklist.txt`), sign chest protection and per-world `worlds/<world>/config.yml`. What Horizon cannot do for them: `physics.no-physics-sand|gravel|allow-portal-anywhere|vine-like-rope-ladders`, `mobs.block-zombie-door-destruction|block-enderdragon-portal-creation|anti-wolf-dumbness`, growth flags other than mushrooms, `on-equip`/`on-dispense`, death messages, pumpkin scuba, conduit effects, item durability, infinite stacks, potion blocking. The void and suffocation teleports use the player's position from a few seconds earlier.
 - `weather-lock` and `time-lock` need a per-player weather and time (not on Horizon): the flags are saved, `/rg flag` warns.
 - `potion-splash` only stops lingering clouds: the splash hook cannot cancel or weaken a hit.
 - `natural-health-regen` cannot tell natural regeneration from other heals: any heal of one point or less is held back (a Regeneration effect too).
