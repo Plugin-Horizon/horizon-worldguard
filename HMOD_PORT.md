@@ -1,5 +1,5 @@
 # hmod port: worldguard
-Parity: before 60% -> after 71% (about 321/450 items; method: commands, permission nodes, config keys, flags and listed features of WorldGuard 7.0.22 counted against the original, ~51 items closed in round 3, items blocked by a missing engine API count as not done)
+Parity: 72% now / 72% with our PRs (323/450 items; with the late-node PR, region-scoped nodes count as done: 324/450; method: commands, permission nodes, config keys, flags and listed features of WorldGuard 7.0.22 counted against the original, items blocked by a missing engine API count as not done; round 3 said 71%, its count was about 321/450)
 
 Round 1
 - Fixed: `entity_interact` takes `HostSide` and returns `Option<InteractionResult>`; a denial is `InteractionResult::Fail` (src/lib.rs).
@@ -54,3 +54,34 @@ Round 3 (100 % round, written blind: nothing compiled or run)
   - HMOD-GAP(redstone_sponge): a redstone-powered sponge's toggling is not simulated (only absorption by placement and flow).
 - Unsure: `LevelHost::state_block`, `has_neighbor_signal`, `HostReader` (`block_entity` + `entity.data` as the chest shop mod reads sign text), the `EntityStruckByLightningEvent`/`EntityJoinLevelEvent` handles and `Hand::Main` on `hand_item` follow the generated reference and other mods; `weather_change`'s `raining`/`thundering` are taken as the new state, and the dimension string as `minecraft:overworld`.
 - Not applicable: `iconomy.*`, `summary-on-start`, `custom-metrics-charts`, `regions.use-paper-entity-origin`, `event-handling.*` (Bukkit event plumbing), SQL region storage.
+
+Round 4 (100 % round, written blind: nothing compiled or run; audit source `audit/worldguard.md`)
+- Added: blacklist file log (`blacklist.logging.file.enable`): each line the blacklist logs also goes to a daily file, `<data-folder>/worldguard/logs/%Y-%m-%d.log` (WorldGuard's default pattern; `%u %w %Y %m %d %W %H %h %i %s %%`, unknown codes `?`). Line format `[yyyy-MM-dd HH:mm:ss] <name>: <message>` CRLF (`worldguard_core/blacklist.rs` `log_file_path`, `log_file_line`, `stamp`; `append_log_line` in `lib.rs`). Times are UTC (the original uses the server's time zone). `blacklist.logging.file.path` and `open-files` are not read (the config keeps no text values); each line opens and appends the file (no open-file cache).
+- Added: region-scoped permission nodes (`worldguard.region.<perm>.<id>`, `.own.`, `.member.`, `flag.flags.*`, `addowner.unclaimed.<id>`) are declared the first time they are asked, behind the cargo feature `horizon_late_permission_nodes` (off by default). It needs `permission_declare_node` of horizon-rust branch `api-permission_late_node_registration` (issue #18807), which the pinned SDK does not have (`has_permission` in `KnownPlayers`, `declare_region_node_once` in `lib.rs`).
+- Fixed: `/wg version` prints `WorldGuard 7.0.22-SNAPSHOT` (was an older plugin version string).
+- Checked and already matching (round 2/3): `/rg flag` with `-e`, `-g`, `-w`, `-h <page>`; `/god`, `/ungod`, `/heal`, `/slay` messages, `-s`, `*`, `.other`; `/wg report`; unknown `/wg` words open to everybody.
+- Permission nodes: `worldguard.region.<perm>.<id>` family (feature only); the rest unchanged (level 2 default).
+
+Checklist round 100
+[x] `/rg` subcommands, aliases and flag options (`-e -g -w -h`) present (commands.rs SPECS, option_spec)
+[x] `/rg flag` and `/rg flags` help paging, `-w` on the list commands
+[x] `/god /ungod /heal /slay` messages, `-s`, `*`, `.other` nodes (lib.rs god/heal branch)
+[x] `/wg reload|flushstates|report|version|running` present; `/wg version` string corrected
+[x] `worldguard.*` nodes declared at gather time (round 1-3 lists)
+[x] `worldguard.region.bypass.<world>` declared for each world and read (round 2)
+[x] blacklist file, console and whitelist-mode logging (round 3, file added round 4)
+[x] region-scoped nodes behind `horizon_late_permission_nodes` (round 4)
+[ ] `worldguard.region.<perm>.<id>` without the feature: refused (API-blocked, late node PR)
+[ ] `/locate`, `worldguard.locate`: no compass target API (HMOD-GAP(compass_target))
+[ ] `/wg profile`, `stopprofile`, `debug`: no profiler or event replay (HMOD-GAP(profiler))
+[ ] `/wg running` lists tasks: the port runs no async tasks, so it always says none
+[ ] `/rg migratedb` only the file store; `migrateuuid` is a stub (no SQL, no UUID migration)
+[ ] blacklist `on-equip`, `on-dispense`, `ignore-groups`, database log (API gaps, GAPS_UPSTREAM)
+[ ] blacklist `path` and `open-files` text options (config keeps no text values)
+[ ] per-world `config.yml` text values (`path`, `dsn`-type options), only booleans, numbers and lists are kept
+[ ] `physics.*`, `mobs.block-zombie-door-destruction`, `enderman` portal, `anti-wolf-dumbness`, growth flags (API gaps)
+[ ] death messages, pumpkin scuba, conduit effects, item durability, infinite stacks, potion blocking (API gaps)
+[ ] `/tp`, portal and splash refusal, vehicle leave (API gaps)
+[ ] `weather-lock`, `time-lock` (per-player weather and time, API gap)
+[ ] `iconomy.*`, `summary-on-start`, `custom-metrics-charts`, `regions.use-paper-entity-origin`, `event-handling.*`: not applicable
+Open items are API-blocked or need a config text store; the checklist is not finished, so this is not 100 %.

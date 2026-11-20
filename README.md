@@ -147,6 +147,7 @@ What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: .
 - `natural-health-regen` cannot tell natural regeneration from other heals: any heal of one point or less is held back (a Regeneration effect too).
 - `lava-harden` acts on any fluid that places a block (cobblestone, stone, basalt, obsidian). `enderman-grief`, `snowman-trails` and `ravager-grief` look at the mob's own position, not the block it would change.
 - `/halt-activity` does not remove the entities that already exist. `/locate` (no compass target), `/wg profile`, `stopprofile` and `debug` (no profiler or event replay) are missing.
-- Region-scoped permission nodes (`worldguard.region.<sub>.<id>` and friends) cannot be declared at start; see HMOD_PORT.md.
-- `ice-melt`, `snow-melt`, `ice-form`, `mushroom-growth` and the other block fade/form/grow flags have rules in the guard but no hook feeds them yet (the fade, form and grow events give no block name without a host).
-- Blacklist, chest protection, sponge, per-world config files and SQL region storage are not ported.
+- Region-scoped permission nodes (`worldguard.region.<sub>.<id>` and friends) are refused unless the cargo feature `horizon_late_permission_nodes` is on: it declares each node the first time it is asked, and needs the host method `permission_declare_node` (horizon-rust branch `api-permission_late_node_registration`, not in the pinned SDK yet).
+- The block fade, form and grow hooks (`ice-melt`, `snow-melt`, `ice-form`, `mushroom-growth`, ...) are written blind; growth flags other than mushrooms have no hook (the grow events give no block name without a host).
+- Blacklist (`worlds/<world>/blacklist.txt`, written blind): no `on-equip`/`on-dispense`, no `ignore-groups`, no database log; the file log (`blacklist.logging.file.enable`) writes WorldGuard's default path under the data folder, in UTC, and ignores `path`/`open-files`.
+- Chest protection, sponge and per-world config files are written blind (round 3); SQL region storage is not ported.
