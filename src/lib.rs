@@ -494,15 +494,32 @@ fn perm_node(name: &str) -> PermissionNode {
     PermissionNode::new(name, PermissionValueType::Boolean)
 }
 
+/// Declares a region-scoped `worldguard.region.*` node after the server started, once per node (the host refuses a
+/// second declaration with `DuplicateNode`, which is ignored). Default: operator level, as the gather-time nodes.
+#[cfg(feature = "horizon_late_permission_nodes")]
+fn declare_region_node_once(host: &mut dyn ServerHost, node: &str) {
+    static DECLARED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+    if !node.starts_with("worldguard.region.") {
+        return;
+    }
+    let mut seen = DECLARED.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.insert(node.to_owned()) {
+        let _ = host.permission_declare_node(&perm_node(node), &NodeDefault::Level(PermissionLevel::from_level(2)));
+    }
+}
+
 impl Players for KnownPlayers<'_> {
     // The node's answer from the permission system (LuckPerms answers through the `player_permission_check` hook);
     // a node that no one declared is refused, and so is any error: a denial, never a grant.
-    // HMOD-GAP(region-scoped-nodes): `worldguard.region.<perm>.<id>` (and `.own.`/`.member.`, `addowner.unclaimed.<id>`)
-    // depend on the region id, so they cannot be declared at gather time. They are refused here, which takes away the
-    // per-region grants of non-operators. Operators still pass through `guard.is_admin` before these are asked.
+    // `worldguard.region.<perm>.<id>` (and `.own.`/`.member.`, `addowner.unclaimed.<id>`) depend on the region id, so
+    // they cannot be declared at gather time. Without the late-declaration API they are refused here, which takes away
+    // the per-region grants of non-operators (HMOD-GAP(region-scoped-nodes)). With `horizon_late_permission_nodes` each
+    // such node is declared the first time it is asked. Operators still pass through `guard.is_admin` before these.
     fn has_permission(&self, uuid: u128, node: &str) -> bool {
         let mut slot = self.host.borrow_mut();
         let host: &mut dyn ServerHost = &mut **slot;
+        #[cfg(feature = "horizon_late_permission_nodes")]
+        declare_region_node_once(host, node);
         let Some(player) = host.player(uuid) else {
             return false;
         };
