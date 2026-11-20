@@ -2084,13 +2084,17 @@ impl Hooks for Mod {
                     && {
                         let r = st.guard.sponge_radius(&dim);
                         let redstone = st.guard.sponge_redstone(&dim);
+                        // gap(has_neighbor_signal): the block_spread hook gets a LevelHost, which has no signal reads
+                        // (LevelTicksHost does, for the tick hooks). Until a level handle reaches this hook, no sponge
+                        // reads as powered, so a redstone-gated sponge absorbs like a plain one.
+                        let powered = |_at: [i32; 3]| false;
                         let mut found = false;
                         'scan: for dx in -r..=r {
                             for dy in -r..=r {
                                 for dz in -r..=r {
                                     let at = [to_at[0] + dx, to_at[1] + dy, to_at[2] + dz];
                                     if level_block(level, at) == "minecraft:sponge"
-                                        && (!redstone || !level.has_neighbor_signal(at))
+                                        && (!redstone || !powered(at))
                                     {
                                         found = true;
                                         break 'scan;
