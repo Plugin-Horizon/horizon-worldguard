@@ -18,3 +18,7 @@ pub mod text;
 pub mod commands;
 pub mod movement;
 pub mod selection;
+pub mod stack;
+pub mod vitals;
+pub mod blacklist;
+pub mod chest;

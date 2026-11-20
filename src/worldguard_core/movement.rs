@@ -411,6 +411,7 @@ mod tests {
             yaw: 0.0,
             pitch: 0.0,
             game_mode: 0,
+            bypass_perm: false,
         }
     }
 

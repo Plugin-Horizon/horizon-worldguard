@@ -246,6 +246,9 @@ pub fn usages() -> Vec<String> {
     .iter()
     .map(|u| (*u).to_owned())
     .collect();
+    // `-w <world>` and `-h <page>` (the flag help page) come before the id.
+    out.push("flag -w <world:word> <id:word> <flag:word> [value:text]".to_owned());
+    out.push("flag -h <page:integer> <id:word> <flag:word> [value:text]".to_owned());
     for def in flags::FLAGS {
         let n = def.name;
         out.push(format!("flag <id:word> {n} [value:text]"));
@@ -1231,6 +1234,14 @@ fn set_flag(guard: &mut Guard, ctx: &mut Ctx<'_>, a: &Args, r: &mut Reply) -> Re
             if ctx.sender.is_none() {
                 r.raw("https://worldguard.enginehub.org/en/latest/regions/flags/#overrides");
             }
+        } else if matches!(def.name, "weather-lock" | "time-lock") {
+            // HMOD-GAP(player_weather_time): no per-player weather or time on Horizon main.
+            r.raw("&c&lWARNING:&c This flag has no effect on this server.".to_owned());
+            r.raw("&dThe value is saved, but players cannot be given their own weather or time yet.".to_owned());
+        } else if def.name == "potion-splash" {
+            // HMOD-GAP(potion_splash_cancel): the splash hook cannot cancel or weaken a hit.
+            r.raw("&c&lWARNING:&c This flag only stops lingering clouds.".to_owned());
+            r.raw("&dSplash potions still reach what stands in the region.".to_owned());
         }
     }
     {
@@ -1514,6 +1525,7 @@ fn add_people(guard: &mut Guard, ctx: &mut Ctx<'_>, a: &Args, r: &mut Reply, own
             && !w.ancestors(&id).iter().any(|p| !p.owners.is_empty())
             && let Some(p) = ctx.sender
             && !guard.is_admin(p)
+            // HMOD-GAP(region-scoped-nodes): `addowner.unclaimed.<id>` is per region and cannot be declared; refused here.
             && !ctx
                 .players
                 .has_permission(p.subject.uuid, &format!("worldguard.region.addowner.unclaimed.{id}"))
@@ -1805,6 +1817,7 @@ mod tests {
             yaw: 0.0,
             pitch: 0.0,
             game_mode: 0,
+            bypass_perm: false,
         }
     }
 
@@ -1853,6 +1866,27 @@ mod tests {
         assert!(g.worlds["world"].get("spawn").unwrap().group("pvp").is_none());
         let r = run_as(&mut g, &mut sel, Some(&op), "rem spawn");
         assert_eq!(r.lines[0], "&dSuccessfully removed spawn.");
+    }
+
+    #[test]
+    fn flags_without_an_effect_warn() {
+        let mut g = Guard::new(Config::default());
+        let mut sel = Store::default();
+        let op = player(9, 4);
+        let (u, s) = cuboid_sel(9, [0, 0, 0], [10, 100, 10]);
+        sel.0.insert(u, s);
+        run_as(&mut g, &mut sel, Some(&op), "define plot");
+        let r = run_as(&mut g, &mut sel, Some(&op), "flag plot weather-lock clear");
+        assert_eq!(r.lines[0], "&c&lWARNING:&c This flag has no effect on this server.");
+        assert_eq!(
+            g.worlds["world"].get("plot").unwrap().flag("weather-lock"),
+            Some(&FlagValue::Str("minecraft:clear".into())),
+            "the value is still saved"
+        );
+        let r = run_as(&mut g, &mut sel, Some(&op), "flag plot potion-splash deny");
+        assert_eq!(r.lines[0], "&c&lWARNING:&c This flag only stops lingering clouds.");
+        let r = run_as(&mut g, &mut sel, Some(&op), "flag plot crop-growth deny");
+        assert!(!has(&r, "WARNING"), "{:?}", r.lines);
     }
 
     #[test]

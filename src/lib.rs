@@ -2,6 +2,9 @@
 //! `worldguard-core` crate (`core/`, the former `api/src/wg/`); this file maps arismoko's hooks and
 //! host calls onto them. Where arismoko has no API yet the line is marked
 //! `TODO(arismoko-api: <name>)` and says what is lost meanwhile. PORT_NOTES.md lists them all.
+
+pub mod worldguard_core;
+mod chest_world;
 use mod_api::{
     TriState, ArmorStandManipulateEvent, AttackEntityEvent, BlockBurnEvent, BlockIgniteEvent,
     BlockSpreadEvent, BreakBlockEvent, BucketEmptyEvent, CanPlayerSleepEvent, Command,
@@ -14,11 +17,18 @@ use mod_api::{
     PlayerLoggedOutEvent, PlayerMoveEvent, PlayerRef, PlayerTeleportedEvent, RegisterCommandsEvent,
     RegisterConfigsEvent, RightClickBlockEvent, RunModCommandEvent, ServerChatEvent, ServerHost,
     ServerStoppingEvent, ServerTickEvent, ServerTickPhase, Suggestion, TabCompleteEvent, Text, TntPrimedEvent,
+    InteractionResult, NodeDefault, PermissionGatherNodesEvent, PermissionLevel, PermissionNode, PermissionValueType,
+    CropGrowPreEvent, EntityChangeBlockPreEvent, EntityMobGriefingEvent, ExplosionStartEvent,
+    FluidPlaceBlockEvent, FoodLevelChangedEvent, Host, LivingExperienceDropEvent, LivingHealEvent, LoopContext,
+    MoistureChangeEvent, BlockFadeEvent, BlockFormEvent, BlockGrowFeatureEvent, EntityStruckByLightningEvent, Hand,
+    SignChangedEvent, WeatherChangeEvent,
 };
-use std::collections::{HashMap, HashSet};
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
+use wg::blacklist::{Blacklist, EventType};
 use wg::commands::{self, Effect, Players};
 use wg::config::{Config as WgConfig, DEFAULT_TOML};
 use wg::geom::BlockPos;
@@ -27,6 +37,7 @@ use wg::movement::{MoveEvent, Tracker};
 use wg::region::Subject;
 use wg::selection::Selections;
 use wg::store::World;
+use wg::vitals::{Change, Vitals};
 use wg::text;
 use worldguard_core as wg;
 
@@ -49,7 +60,6 @@ fn lock(m: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
 /// Field names are the ones the rules were written with.
 #[derive(Clone)]
 struct Snap {
-    #[allow(dead_code)]
     player: PlayerRef,
     entity_id: i32,
     uuid: u128,
@@ -88,6 +98,20 @@ struct State {
     teleported: HashSet<u128>,
     /// Players in `/god` mode (damage to them is cancelled).
     god: HashSet<u128>,
+    /// `heal-*` / `feed-*` timers.
+    vitals: Vitals,
+    /// Players who hold `worldguard.region.bypass.<world>` for the world they are in (read once a second).
+    bypass: HashSet<u128>,
+    /// `worlds/<world>/blacklist.txt`, by world folder name.
+    blacklists: HashMap<String, Blacklist>,
+    /// The weather last allowed per dimension (raining, thundering).
+    weather: HashMap<String, (bool, bool)>,
+    /// Where each player was, once a second (the last four), to move them out of the void or a wall.
+    trail: HashMap<u128, VecDeque<(String, [f64; 3])>>,
+    /// Players whose void or suffocation damage was cancelled and who are moved at the next tick.
+    rescues: Vec<u128>,
+    /// Sponges placed (dimension, position): the water around them is cleared at the next tick.
+    sponge_clears: Vec<(String, [i32; 3])>,
 }
 
 impl Default for State {
@@ -108,6 +132,13 @@ impl Default for State {
             explosives: HashMap::new(),
             teleported: HashSet::new(),
             god: HashSet::new(),
+            vitals: Vitals::default(),
+            bypass: HashSet::new(),
+            blacklists: HashMap::new(),
+            weather: HashMap::new(),
+            trail: HashMap::new(),
+            rescues: Vec::new(),
+            sponge_clears: Vec::new(),
         }
     }
 }
@@ -183,7 +214,48 @@ impl State {
         }
     }
 
+    /// Reads a world's regions, its own `config.yml` and its `blacklist.txt`.
     fn load_world(&mut self, name: &str) -> String {
+        let message = self.load_regions(name);
+        self.load_world_options(name);
+        message
+    }
+
+    /// `worlds/<world>/config.yml` (options for this world only) and `worlds/<world>/blacklist.txt`.
+    fn load_world_options(&mut self, name: &str) {
+        let Some(dir) = self.data_dir.as_ref().map(|d| d.join("worlds").join(name)) else {
+            return;
+        };
+        match std::fs::read_to_string(dir.join("config.yml")) {
+            Ok(text) => {
+                if let Err(e) = self.guard.cfg.set_world_yaml(name, &text) {
+                    eprintln!("[worldguard] {name}/config.yml is not readable, kept the old options: {e}");
+                }
+            }
+            Err(_) => {
+                self.guard.cfg.world_rules.remove(name);
+            }
+        }
+        let whitelist = self.guard.cfg.rule_in(name, "blacklist.use-as-whitelist");
+        match std::fs::read_to_string(dir.join("blacklist.txt")) {
+            Ok(text) => {
+                let (bl, warnings) = Blacklist::parse(&text, whitelist);
+                for w in warnings {
+                    eprintln!("[worldguard] {name}/blacklist.txt: {w}");
+                }
+                if bl.is_empty() {
+                    self.blacklists.remove(name);
+                } else {
+                    self.blacklists.insert(name.to_owned(), bl);
+                }
+            }
+            Err(_) => {
+                self.blacklists.remove(name);
+            }
+        }
+    }
+
+    fn load_regions(&mut self, name: &str) -> String {
         let Some(file) = self.region_file(name) else {
             return "No world is open.".into();
         };
@@ -267,6 +339,7 @@ impl State {
             yaw: p.yaw,
             pitch: p.pitch,
             game_mode: p.game_mode,
+            bypass_perm: self.bypass.contains(&p.uuid),
         }
     }
 
@@ -393,22 +466,64 @@ fn bp_of(p: impl Into<[i32; 3]>) -> BlockPos {
 
 struct KnownPlayers<'a> {
     names: &'a HashMap<String, (u128, String)>,
-    host: &'a dyn ServerHost,
+    // The permission query needs the host mutably, and `Players` takes `&self`: the cell lends it for each query.
+    host: RefCell<&'a mut dyn ServerHost>,
     op_level: u8,
 }
 
+/// The block name (`minecraft:stone`) of a state, "" when unknown.
+fn state_name(level: &dyn LevelHost, state: mod_api::BlockState) -> String {
+    level.state_block(state).unwrap_or("").to_owned()
+}
+
+/// The block name at `pos` through a level hook's `LevelHost`.
+fn level_block(level: &dyn LevelHost, pos: [i32; 3]) -> String {
+    level.block_state(pos).map(|s| state_name(level, s)).unwrap_or_default()
+}
+
+/// The block name at `pos` through the server host.
+fn host_block(host: &dyn ServerHost, dimension: &str, pos: [i32; 3]) -> String {
+    host.level(dimension)
+        .and_then(|l| l.block(host, pos))
+        .map(|k| k.id(host).to_string())
+        .unwrap_or_default()
+}
+
+/// The typed node for one `worldguard.*` name (a Boolean, as the commands ask it).
+fn perm_node(name: &str) -> PermissionNode {
+    PermissionNode::new(name, PermissionValueType::Boolean)
+}
+
+/// Declares a region-scoped `worldguard.region.*` node after the server started, once per node (the host refuses a
+/// second declaration with `DuplicateNode`, which is ignored). Default: operator level, as the gather-time nodes.
+#[cfg(feature = "horizon_late_permission_nodes")]
+fn declare_region_node_once(host: &mut dyn ServerHost, node: &str) {
+    static DECLARED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+    if !node.starts_with("worldguard.region.") {
+        return;
+    }
+    let mut seen = DECLARED.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.insert(node.to_owned()) {
+        let _ = host.permission_declare_node(&perm_node(node), &NodeDefault::Level(PermissionLevel::from_level(2)));
+    }
+}
+
 impl Players for KnownPlayers<'_> {
-    // A permission provider's value for the node first (LuckPerms answers through the
-    // `player_permission_check` hook); where none decided, the operator level as before.
+    // The node's answer from the permission system (LuckPerms answers through the `player_permission_check` hook);
+    // a node that no one declared is refused, and so is any error: a denial, never a grant.
+    // `worldguard.region.<perm>.<id>` (and `.own.`/`.member.`, `addowner.unclaimed.<id>`) depend on the region id, so
+    // they cannot be declared at gather time. Without the late-declaration API they are refused here, which takes away
+    // the per-region grants of non-operators (HMOD-GAP(region-scoped-nodes)). With `horizon_late_permission_nodes` each
+    // such node is declared the first time it is asked. Operators still pass through `guard.is_admin` before these.
     fn has_permission(&self, uuid: u128, node: &str) -> bool {
-        let player = self.host.player(uuid);
-        if let Some(answer) = player.and_then(|p| p.permission_value(self.host, node)) {
-            return answer;
-        }
-        let level = player
-            .and_then(|p| p.permission_level(self.host))
-            .unwrap_or(0);
-        level >= self.op_level
+        let mut slot = self.host.borrow_mut();
+        let host: &mut dyn ServerHost = &mut **slot;
+        #[cfg(feature = "horizon_late_permission_nodes")]
+        declare_region_node_once(host, node);
+        let Some(player) = host.player(uuid) else {
+            return false;
+        };
+        player.permission_bool(host, &perm_node(node)).unwrap_or(false)
     }
     fn resolve(&self, name: &str) -> Option<(u128, String)> {
         self.names.get(&name.to_ascii_lowercase()).cloned()
@@ -424,8 +539,12 @@ impl Players for KnownPlayers<'_> {
 impl Mod {
     fn load_config(&self, text: &str, what: &str) {
         match WgConfig::parse(text) {
-            Ok(cfg) => {
-                lock(&self.st).guard.cfg = cfg;
+            Ok(mut cfg) => {
+                let mut st = lock(&self.st);
+                // The worlds' own config files are not part of the common file.
+                cfg.world_rules = std::mem::take(&mut st.guard.cfg.world_rules);
+                st.guard.cfg = cfg;
+                drop(st);
                 eprintln!("[worldguard] config {what}");
             }
             Err(e) => eprintln!("[worldguard] config not {what}, keeping the old one: {e}"),
@@ -453,7 +572,7 @@ impl Mod {
         let op_level = st.guard.cfg.op_level;
         let known = KnownPlayers {
             names: &names,
-            host: &*host,
+            host: RefCell::new(&mut *host),
             op_level,
         };
         let State {
@@ -493,6 +612,89 @@ impl Mod {
             }
         }
         lines
+    }
+
+    /// Runs the blacklist of the player's world for `kind` of `target` (a block or item id).
+    /// Queues the player's message, the notices to operators, the log lines and a kick or ban;
+    /// returns whether the action is allowed.
+    fn blacklist_check(&self, host: &mut dyn ServerHost, p: &Player, kind: EventType, target: &str, silent: bool) -> bool {
+        if target.is_empty() {
+            return true;
+        }
+        let mut st = lock(&self.st);
+        let world = st.guard.cfg.world_of(&p.dimension);
+        let data_dir = st.data_dir.clone();
+        let now_ms = st.ticks * 1000 / TPS;
+        let State { blacklists, guard, by_uuid, tells, commands, .. } = &mut *st;
+        let Some(bl) = blacklists.get_mut(&world) else {
+            return true;
+        };
+        if !bl.has_target(target) {
+            return true;
+        }
+        let player = host.player(p.subject.uuid);
+        let event = wg::blacklist::Event {
+            kind,
+            player: Some(p.subject.name.clone()),
+            target: target.to_owned(),
+        };
+        // `ignore-perms`: a node that nobody declared is refused, so only declared nodes can exempt.
+        let mut ignores = |_groups: &[String], perms: &[String]| {
+            player.is_some_and(|pl| {
+                perms
+                    .iter()
+                    .any(|n| pl.permission_bool(&mut *host, &perm_node(n.trim())).unwrap_or(false))
+            })
+        };
+        let verdict = bl.check(&event, false, silent, now_ms, &mut ignores);
+        let log_console = guard.rule(&p.dimension, "blacklist.logging.console.enable");
+        for l in &verdict.log {
+            if log_console {
+                eprintln!("[worldguard] {l}");
+            }
+        }
+        // `blacklist.logging.file.enable`: the same lines, into the daily file of the world's pattern.
+        if guard.rule(&p.dimension, "blacklist.logging.file.enable") {
+            if let Some(dir) = &data_dir {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                for l in &verdict.log {
+                    if let Some(path) = wg::blacklist::log_file_path(wg::blacklist::LOG_FILE_PATTERN, &world, Some(&p.subject.name), now) {
+                        append_log_line(&dir.join(path), &wg::blacklist::log_file_line(&p.subject.name, l, now));
+                    }
+                }
+            }
+        }
+        for n in &verdict.notify {
+            eprintln!("[worldguard] {n}");
+            for s in by_uuid.values().filter(|s| s.permission >= guard.cfg.op_level) {
+                tells.push((s.uuid, format!("&7{n}")));
+            }
+        }
+        for t in &verdict.tell {
+            tells.push((p.subject.uuid, format!("&c{t}")));
+        }
+        if let Some(reason) = &verdict.kick {
+            commands.push(format!("kick {} {reason}", p.subject.name));
+        }
+        if let Some(reason) = &verdict.ban {
+            commands.push(format!("ban {} {reason}", p.subject.name));
+        }
+        verdict.allowed
+    }
+
+    /// `chest-protection.enable`: whether the block at `pos` is locked against `p` by a `[Lock]` sign.
+    fn chest_locked(&self, host: &mut dyn ServerHost, p: &Player, pos: [i32; 3]) -> bool {
+        if !lock(&self.st).guard.rule(&p.dimension, "chest-protection.enable") {
+            return false;
+        }
+        let uuid = p.subject.uuid;
+        if may(host, uuid, "worldguard.chest-protection.override", 0) || may(host, uuid, "worldguard.override.chest-protection", 0) {
+            return false;
+        }
+        let reader = chest_world::HostReader { host: &*host, dimension: &p.dimension };
+        wg::chest::is_protected(&reader, pos, Some(&p.subject.name))
     }
 
     /// The deny line for a player, and a cancel. A player is told at most twice a second
@@ -590,17 +792,44 @@ impl Mod {
             }
             "running" | "queue" => vec!["&dThere are currently no running tasks.".into()],
             "" | "version" => vec![
-                // The Java plugin's version (plugin.yml), not this port's crate version.
-                "&dWorldGuard 7.0.20+2410-0b6c3f1".to_owned(),
+                // The Java plugin's version (gradle.properties of the WorldGuard source this port follows).
+                "&dWorldGuard 7.0.22-SNAPSHOT".to_owned(),
                 "&dhttp://www.enginehub.org".to_owned(),
                 "&7----------- Platforms -----------".to_owned(),
                 "&7* Horizon".to_owned(),
             ],
-            "report" | "profile" | "stopprofile" | "debug" => {
-                vec![format!("&c/wg {sub} is not available yet.")]
+            "report" => {
+                if arg.split_whitespace().any(|a| a == "-p") {
+                    return vec!["&cThe report cannot be uploaded: there is no paste service.".into()];
+                }
+                let Some(dir) = st.data_dir.clone() else {
+                    return vec!["&cFailed to write report: no world is open.".into()];
+                };
+                let mut report = String::from("WorldGuard report\n=================\nPlatform: Horizon\n\nWorlds\n------\n");
+                for (name, w) in &st.guard.worlds {
+                    report.push_str(&format!("{name}: {} region(s)\n", w.all().count()));
+                }
+                report.push_str("\nWorld options that are switched on\n----------------------------------\n");
+                for (key, on) in &st.guard.cfg.rules {
+                    if *on {
+                        report.push_str(&format!("{key}\n"));
+                    }
+                }
+                let file = dir.join("report.txt");
+                match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&file, report)) {
+                    Ok(()) => vec![format!(
+                        "&dWorldGuard report written to {}/report.txt",
+                        st.guard.cfg.data_folder.trim_end_matches('/')
+                    )],
+                    Err(e) => vec![format!("&cFailed to write report: {e}")],
+                }
+            }
+            // HMOD-GAP(profiler): Horizon gives a mod no thread sampler and no way to replay events.
+            "profile" | "stopprofile" | "debug" => {
+                vec![format!("&c/wg {sub} is not available on Horizon.")]
             }
             _ => vec![
-                "&cUnknown subcommand. Use /wg reload, flushstates, running or version.".into(),
+                "&cUnknown subcommand. Use /wg reload, flushstates, running, report, profile, stopprofile, debug or version.".into(),
             ],
         }
     }
@@ -649,11 +878,14 @@ impl Mod {
         match root {
             "rg" | "region" | "regions" => self.region_command(host, sender, args),
             "god" | "ungod" | "heal" | "slay" => self.general_command(host, root, sender, args),
+            "stopfire" | "allowfire" => self.fire_command(host, root, sender, args),
+            "halt-activity" | "stoplag" | "haltactivity" => self.halt_command(host, root, sender, args),
+            "stack" => self.stack_command(host, sender),
             _ => {
                 if let Some(s) = sender {
                     if let Some(node) = wg_node(args) {
                         let op_level = lock(&self.st).guard.cfg.op_level;
-                        if !may(&*host, s.uuid, node, op_level) {
+                        if !may(&mut *host, s.uuid, node, op_level) {
                             return vec![NO_PERMISSION.to_owned()];
                         }
                     }
@@ -663,9 +895,29 @@ impl Mod {
         }
     }
 
-    /// WorldGuard's general commands `/god`, `/ungod`, `/heal`, `/slay` (own or `<player>`; the
-    /// `.other` node for another player). Not ported: `/stack`, `/stoplag`, `/halt-activity`,
-    /// `/locate` (see PORT_NOTES.md).
+    /// The players a command names: `*` for everybody online, else a name (exact, or the only one
+    /// that starts with it).
+    fn match_targets(&self, query: &str) -> Result<Vec<(u128, String)>, String> {
+        let st = lock(&self.st);
+        if query == "*" {
+            let all: Vec<(u128, String)> = st.by_uuid.values().map(|p| (p.uuid, p.name.clone())).collect();
+            return if all.is_empty() { Err("&cNo players matched query.".to_owned()) } else { Ok(all) };
+        }
+        let q = query.to_ascii_lowercase();
+        let online: Vec<&Snap> = st.by_uuid.values().collect();
+        if let Some(p) = online.iter().find(|p| p.name.to_ascii_lowercase() == q) {
+            return Ok(vec![(p.uuid, p.name.clone())]);
+        }
+        let partial: Vec<&&Snap> = online.iter().filter(|p| p.name.to_ascii_lowercase().starts_with(&q)).collect();
+        match partial.as_slice() {
+            [p] => Ok(vec![(p.uuid, p.name.clone())]),
+            [] => Err(format!("&cNo players matched query '{query}'.")),
+            _ => Err("&cMore than one player found! Use the exact name or '*'.".to_owned()),
+        }
+    }
+
+    /// WorldGuard's `/god`, `/ungod`, `/heal`, `/slay` (own, or `<player>` / `*` with the `.other`
+    /// node; `-s` keeps the targets from being told).
     fn general_command(
         &self,
         host: &mut dyn ServerHost,
@@ -675,50 +927,291 @@ impl Mod {
     ) -> Vec<String> {
         let base = format!("worldguard.{}", if root == "ungod" { "god" } else { root });
         let op_level = lock(&self.st).guard.cfg.op_level;
-        if let Some(s) = sender {
-            if !may(&*host, s.uuid, &base, op_level) {
-                return vec![NO_PERMISSION.to_owned()];
+        let mut silent = false;
+        let mut words: Vec<&str> = Vec::new();
+        for w in args.split_whitespace() {
+            if w == "-s" {
+                silent = true;
+            } else if w.starts_with('-') && w.len() > 1 && !w[1..].starts_with(|c: char| c.is_ascii_digit()) {
+                return vec![format!("&cUnknown flag: {}", &w[1..])];
+            } else {
+                words.push(w);
             }
         }
-        let (uuid, name, other) = match args.split_whitespace().next() {
-            None => match sender {
-                Some(s) => (s.uuid, s.name.clone(), false),
-                None => return vec!["&cA player is expected.".to_owned()],
-            },
+        if words.len() > 1 {
+            return vec!["&cToo many parameters.".to_owned(), format!("&cUsage: /{root} [player]")];
+        }
+        let targets = match words.first() {
+            None => {
+                let Some(s) = sender else { return vec!["&cA player is expected.".to_owned()] };
+                if !may(&mut *host, s.uuid, &base, op_level) {
+                    return vec![NO_PERMISSION.to_owned()];
+                }
+                vec![(s.uuid, s.name.clone())]
+            }
             Some(n) => {
                 if let Some(s) = sender {
-                    if !may(&*host, s.uuid, &format!("{base}.other"), op_level) {
+                    if !may(&mut *host, s.uuid, &format!("{base}.other"), op_level) {
                         return vec![NO_PERMISSION.to_owned()];
                     }
                 }
-                let st = lock(&self.st);
-                match st.names.get(&n.to_ascii_lowercase()).cloned() {
-                    Some((u, real)) if st.by_uuid.contains_key(&u) => (u, real, true),
-                    _ => return vec![format!("&cNo players matched query '{n}'.")],
+                match self.match_targets(n) {
+                    Ok(t) => t,
+                    Err(e) => return vec![e],
                 }
             }
         };
-        let mut st = lock(&self.st);
-        match root {
-            "god" => {
-                st.god.insert(uuid);
-                vec![if other { format!("&dEnabled god mode for {name}.") } else { "&dGodmode enabled!".to_owned() }]
+        let me = sender.map(|s| s.uuid);
+        let sender_name = sender.map_or("Console".to_owned(), |s| s.name.clone());
+        let mut included = false;
+        let mut out: Vec<String> = Vec::new();
+        for (uuid, name) in targets {
+            let own = Some(uuid) == me;
+            let (self_line, other_line) = match root {
+                "god" => ("&dGod mode enabled! Use /ungod to disable.", format!("&dGod enabled by {sender_name}.")),
+                "ungod" => ("&dGod mode disabled!", format!("&dGod disabled by {sender_name}.")),
+                "heal" => ("&dHealed!", format!("&dHealed by {sender_name}.")),
+                _ => ("&dSlain!", format!("&dSlain by {sender_name}.")),
+            };
+            match root {
+                "god" => {
+                    lock(&self.st).god.insert(uuid);
+                }
+                "ungod" => {
+                    lock(&self.st).god.remove(&uuid);
+                }
+                "heal" => {
+                    if let Some(player) = host.player(uuid) {
+                        let max = host
+                            .living(player.entity())
+                            .and_then(|l| l.max_health(&*host))
+                            .unwrap_or(20.0);
+                        if let Some(living) = host.living(player.entity()) {
+                            let _ = living.set_health(&mut *host, max);
+                        }
+                        let _ = player.set_food_level(&mut *host, 20);
+                        let _ = player.set_saturation(&mut *host, 20.0);
+                        let _ = player.set_exhaustion(&mut *host, 0.0);
+                    }
+                }
+                _ => {
+                    // The name comes from the players seen on this server, never from the typed text.
+                    lock(&self.st).commands.push(format!("kill {name}"));
+                }
             }
-            "ungod" => {
-                st.god.remove(&uuid);
-                vec![if other { format!("&dDisabled god mode for {name}.") } else { "&dGodmode disabled!".to_owned() }]
-            }
-            "heal" => {
-                // The name comes from the players seen on this server, never from the typed text.
-                st.commands.push(format!("effect give {name} minecraft:instant_health 1 10 true"));
-                st.commands.push(format!("effect give {name} minecraft:saturation 1 20 true"));
-                vec![if other { format!("&dHealed {name}.") } else { "&dHealed!".to_owned() }]
-            }
-            _ => {
-                st.commands.push(format!("kill {name}"));
-                vec![if other { format!("&dSlain {name}.") } else { "&dSlain!".to_owned() }]
+            if own {
+                out.push(self_line.to_owned());
+                included = true;
+            } else if !silent {
+                tell(host, uuid, &other_line);
             }
         }
+        if !included {
+            out.push(
+                match root {
+                    "god" => "&dPlayers now have god mode.",
+                    "ungod" => "&dPlayers no longer have god mode.",
+                    "heal" => "&dPlayers healed.",
+                    _ => "&dPlayers slain.",
+                }
+                .to_owned(),
+            );
+        }
+        out
+    }
+
+    /// `broadcastNotification`: the console log and the operators online.
+    fn notify(&self, host: &mut dyn ServerHost, line: &str) {
+        eprintln!("[worldguard] {}", text::plain(line));
+        let op_level = lock(&self.st).guard.cfg.op_level;
+        for p in online(&*host).iter().filter(|p| p.permission >= op_level) {
+            tell(host, p.uuid, line);
+        }
+    }
+
+    /// `/stopfire [world]` and `/allowfire [world]`.
+    fn fire_command(
+        &self,
+        host: &mut dyn ServerHost,
+        root: &str,
+        sender: Option<&Snap>,
+        args: &str,
+    ) -> Vec<String> {
+        let op_level = lock(&self.st).guard.cfg.op_level;
+        if let Some(s) = sender {
+            if !may(&mut *host, s.uuid, "worldguard.fire-toggle.stop", op_level) {
+                return vec![NO_PERMISSION.to_owned()];
+            }
+        }
+        let words: Vec<&str> = args.split_whitespace().collect();
+        if words.len() > 1 {
+            return vec!["&cToo many parameters.".to_owned(), format!("&cUsage: /{root} [<world>]")];
+        }
+        let world = match words.first() {
+            Some(w) => {
+                let st = lock(&self.st);
+                match st.guard.cfg.worlds.values().find(|n| n.eq_ignore_ascii_case(w)) {
+                    Some(n) => n.clone(),
+                    None => return vec!["&cNo world by that exact name found.".to_owned()],
+                }
+            }
+            None => match sender {
+                Some(s) => lock(&self.st).guard.cfg.world_of(&s.dimension),
+                None => return vec!["&cA player is expected.".to_owned()],
+            },
+        };
+        let stop = root == "stopfire";
+        let name = sender.map_or("Console".to_owned(), |s| s.name.clone());
+        let changed = {
+            let mut st = lock(&self.st);
+            if stop {
+                st.guard.fire_stopped.insert(world.clone())
+            } else {
+                st.guard.fire_stopped.remove(&world)
+            }
+        };
+        if changed {
+            let line = if stop {
+                format!("&eFire spread has been globally disabled for '{world}' by {name}.")
+            } else {
+                format!("&eFire spread has been globally for '{world}' re-enabled by {name}.")
+            };
+            self.notify(host, &line);
+            Vec::new()
+        } else if stop {
+            vec!["&dFire spread was already globally disabled.".to_owned()]
+        } else {
+            vec!["&dFire spread was already globally enabled.".to_owned()]
+        }
+    }
+
+    /// `/halt-activity [confirm]` (`/stoplag`, `/haltactivity`) with `-c` (lift), `-i` (status), `-s` (silent).
+    // HMOD-GAP(halt_entities): the entities that are already there are not removed (no way to list the
+    // loaded entities of a level); spawns, explosions, fire, leaf decay and fluid flow are stopped.
+    fn halt_command(
+        &self,
+        host: &mut dyn ServerHost,
+        root: &str,
+        sender: Option<&Snap>,
+        args: &str,
+    ) -> Vec<String> {
+        let op_level = lock(&self.st).guard.cfg.op_level;
+        if let Some(s) = sender {
+            if !may(&mut *host, s.uuid, "worldguard.halt-activity", op_level) {
+                return vec![NO_PERMISSION.to_owned()];
+            }
+        }
+        let (mut lift, mut status, mut silent) = (false, false, false);
+        let mut words: Vec<&str> = Vec::new();
+        for w in args.split_whitespace() {
+            match w {
+                "-c" => lift = true,
+                "-i" => status = true,
+                "-s" => silent = true,
+                "-cis" | "-csi" | "-ics" | "-isc" | "-sci" | "-sic" | "-ci" | "-ic" | "-cs" | "-sc" | "-is" | "-si" => {
+                    lift |= w.contains('c');
+                    status |= w.contains('i');
+                    silent |= w.contains('s');
+                }
+                _ => words.push(w),
+            }
+        }
+        if words.len() > 1 {
+            return vec!["&cToo many parameters.".to_owned(), format!("&cUsage: /{root} [confirm]")];
+        }
+        let halted = lock(&self.st).guard.activity_halted;
+        if status {
+            return vec![if halted {
+                "&dALL intensive server activity is not allowed.".to_owned()
+            } else {
+                "&dALL intensive server activity is allowed.".to_owned()
+            }];
+        }
+        let halt = !lift;
+        if halt && !words.first().is_some_and(|w| w.eq_ignore_ascii_case("confirm")) {
+            return vec![
+                "&cThis command will &c&lPERMANENTLY&r&c erase ALL animals in ALL loaded chunks in ALL loaded worlds.".to_owned(),
+                format!("&aType &f/{root} confirm&c to confirm."),
+            ];
+        }
+        lock(&self.st).guard.activity_halted = halt;
+        let name = sender.map_or("Console".to_owned(), |s| s.name.clone());
+        let mut out = Vec::new();
+        if halt {
+            if sender.is_none() {
+                out.push("&dALL intensive server activity halted.".to_owned());
+            }
+            if silent {
+                out.push(format!("&d(Silent) ALL intensive server activity halted by {name}."));
+            } else {
+                self.notify(host, &format!("&eALL intensive server activity halted by {name}."));
+            }
+        } else if silent {
+            out.push("&d(Silent) ALL intensive server activity is now allowed.".to_owned());
+        } else {
+            self.notify(host, "&eALL intensive server activity is now allowed.");
+            if sender.is_none() {
+                out.push("&dALL intensive server activity is now allowed.".to_owned());
+            }
+        }
+        out
+    }
+
+    /// `/stack`: merges the player's stacks of the same item (main inventory and hotbar).
+    fn stack_command(&self, host: &mut dyn ServerHost, sender: Option<&Snap>) -> Vec<String> {
+        let Some(s) = sender else { return vec!["&cA player is expected.".to_owned()] };
+        let op_level = lock(&self.st).guard.cfg.op_level;
+        if !may(&mut *host, s.uuid, "worldguard.stack", op_level) {
+            return vec![NO_PERMISSION.to_owned()];
+        }
+        let Some(mut slots) = s.player.inventory_slots(&*host) else {
+            return vec!["&cYour inventory cannot be read.".to_owned()];
+        };
+        slots.retain(|(slot, _)| *slot < 36);
+        slots.sort_by_key(|(slot, _)| *slot);
+        let mut firsts: Vec<usize> = Vec::new();
+        let mut entries: Vec<wg::stack::Entry> = Vec::new();
+        for (i, (slot, stack)) in slots.iter().enumerate() {
+            let group = match firsts.iter().position(|f| slots[*f].1.is_stackable_with(stack)) {
+                Some(g) => g,
+                None => {
+                    firsts.push(i);
+                    firsts.len() - 1
+                }
+            };
+            entries.push(wg::stack::Entry {
+                slot: *slot,
+                group,
+                count: stack.count(),
+                max: host.max_stack_size(stack.item()).unwrap_or(64),
+            });
+        }
+        for (slot, count) in wg::stack::compact(&entries) {
+            let Some((_, original)) = slots.iter().find(|(n, _)| *n == slot) else { continue };
+            let mut stack = original.clone();
+            let replacement = if count == 0 {
+                None
+            } else if stack.set_count(count).is_ok() {
+                Some(stack)
+            } else {
+                continue;
+            };
+            let _ = s.player.set_inventory_slot(&mut *host, slot, replacement);
+        }
+        vec!["&dItems compacted into stacks!".to_owned()]
+    }
+}
+
+/// Appends one line to a blacklist log file, creating its folder (`FileHandler.log`). A failed write goes to the
+/// console and is otherwise ignored, as the original does.
+fn append_log_line(path: &Path, line: &str) {
+    use std::io::Write;
+    let res = path.parent().map_or(Ok(()), |dir| std::fs::create_dir_all(dir)).and_then(|()| {
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        file.write_all(line.as_bytes())
+    });
+    if let Err(e) = res {
+        eprintln!("[worldguard] Could not write the blacklist log: {e}");
     }
 }
 
@@ -730,8 +1223,12 @@ fn wg_node(args: &str) -> Option<&'static str> {
         "" | "version" => None,
         "flushstates" | "clearstates" => Some("worldguard.flushstates"),
         "running" | "queue" => Some("worldguard.running"),
-        "report" | "profile" | "stopprofile" | "debug" => Some("worldguard.report"),
-        _ => Some("worldguard.reload"),
+        "report" => Some("worldguard.report"),
+        "profile" | "stopprofile" => Some("worldguard.profile"),
+        "debug" => Some("worldguard.debug.event"),
+        "reload" => Some("worldguard.reload"),
+        // An unknown word is answered with the list of subcommands, to everybody.
+        _ => None,
     }
 }
 
@@ -744,7 +1241,10 @@ fn wg_node(args: &str) -> Option<&'static str> {
 
 static SLASH_AWARE: AtomicBool = AtomicBool::new(false);
 
-const OUR_ROOTS: &[&str] = &["rg", "region", "regions", "wg", "worldguard", "god", "ungod", "heal", "slay"];
+const OUR_ROOTS: &[&str] = &[
+    "rg", "region", "regions", "wg", "worldguard", "god", "ungod", "heal", "slay", "stopfire", "allowfire",
+    "halt-activity", "stoplag", "haltactivity", "stack",
+];
 
 // --- completions ----------------------------------------------------------------------------------
 //
@@ -772,17 +1272,37 @@ fn starts_with_any_case(word: &str, prefix: &str) -> bool {
 
 /// Whether the player may use `/rg <sub>` at all: an operator, a `player-commands` entry, or a provider's grant of
 /// `worldguard.region.<sub>` (also its `.own` / `.member` forms, which apply to regions the player stands in).
-fn may_rg_sub(host: &dyn ServerHost, uuid: u128, op_level: u8, player_commands: &[String], sub: &str) -> bool {
+fn may_rg_sub(host: &mut dyn ServerHost, uuid: u128, op_level: u8, player_commands: &[String], sub: &str) -> bool {
     let Some(p) = host.player(uuid) else { return false };
-    if p.permission_level(host).unwrap_or(0) >= op_level || player_commands.iter().any(|c| c == sub) {
+    if p.permission_level(&*host).unwrap_or(0) >= op_level || player_commands.iter().any(|c| c == sub) {
         return true;
     }
-    ["", ".own", ".member"].iter().any(|tail| p.permission_value(host, &format!("worldguard.region.{sub}{tail}")) == Some(true))
+    ["", ".own", ".member"].iter().any(|tail| {
+        p.permission_bool(&mut *host, &perm_node(&format!("worldguard.region.{sub}{tail}"))).unwrap_or(false)
+    })
 }
 
 impl Mod {
+    /// Re-reads `worldguard.region.bypass.<world>` for every online player. The node's default is
+    /// the operator level, so operators hold it unless a permission plugin says otherwise.
+    fn refresh_bypass(&self, host: &mut dyn ServerHost) {
+        let players = online(&*host);
+        let worlds: Vec<String> = {
+            let st = lock(&self.st);
+            players.iter().map(|p| st.guard.cfg.world_of(&p.dimension)).collect()
+        };
+        let mut holders = HashSet::new();
+        for (np, world) in players.iter().zip(worlds) {
+            let node = perm_node(&format!("worldguard.region.bypass.{world}"));
+            if np.player.permission_bool(&mut *host, &node).unwrap_or(false) {
+                holders.insert(np.uuid);
+            }
+        }
+        lock(&self.st).bypass = holders;
+    }
+
     /// The words that complete the last word of `rest` (what follows `/rg `).
-    fn complete_region(&self, host: &dyn ServerHost, uuid: u128, rest: &str) -> Vec<String> {
+    fn complete_region(&self, host: &mut dyn ServerHost, uuid: u128, rest: &str) -> Vec<String> {
         let tokens: Vec<&str> = rest.split(' ').collect();
         let n = tokens.len() - 1;
         let prefix = tokens[n];
@@ -790,7 +1310,7 @@ impl Mod {
             let st = lock(&self.st);
             let dimension = host
                 .player(uuid)
-                .and_then(|p| p.entity().level(host))
+                .and_then(|p| p.entity().level(&*host))
                 .map(|l| l.dimension_id().to_string())
                 .unwrap_or_else(|| OVERWORLD.to_owned());
             (st.guard.cfg.op_level, st.guard.cfg.player_commands.clone(), st.guard.cfg.world_of(&dimension))
@@ -894,30 +1414,88 @@ impl Mod {
     }
 
     /// The words that complete the last word of `rest` (what follows `/wg `).
-    fn complete_wg(&self, host: &dyn ServerHost, uuid: u128, rest: &str) -> Vec<String> {
+    fn complete_wg(&self, host: &mut dyn ServerHost, uuid: u128, rest: &str) -> Vec<String> {
         if rest.contains(' ') {
             return Vec::new();
         }
         let op_level = lock(&self.st).guard.cfg.op_level;
-        ["version", "reload", "flushstates", "running"]
+        ["version", "reload", "flushstates", "running", "report", "profile", "stopprofile", "debug"]
             .iter()
-            .filter(|sub| wg_node(sub).is_none_or(|node| may(host, uuid, node, op_level)))
+            .filter(|sub| wg_node(sub).is_none_or(|node| may(&mut *host, uuid, node, op_level)))
             .filter(|sub| starts_with_any_case(sub, rest))
             .map(|sub| (*sub).to_owned())
             .collect()
     }
 }
 
-/// A provider's answer for `node`, else the operator level (the same rule as `KnownPlayers`).
-fn may(host: &dyn ServerHost, uuid: u128, node: &str, op_level: u8) -> bool {
-    host.player(uuid).is_some_and(|p| {
-        let level = p.permission_level(host).unwrap_or(0);
-        p.permission_value(host, node).unwrap_or(level >= op_level)
-    })
+/// The node's answer from the permission system: its declared default is the operator level (`permission_gather_nodes`),
+/// so the level fallback is in the answer itself. An undeclared node or an error is a denial.
+fn may(host: &mut dyn ServerHost, uuid: u128, node: &str, _op_level: u8) -> bool {
+    host.player(uuid).is_some_and(|p| p.permission_bool(&mut *host, &perm_node(node)).unwrap_or(false))
 }
 
 #[mod_api::horizon_mod]
 impl Hooks for Mod {
+    fn permission_gather_nodes(&self, event: &mut PermissionGatherNodesEvent<'_>) {
+        // Every node known before any region exists. Their default is the operator level the string nodes fell back to
+        // (`op-permission-level`, 2 by default). Region-scoped nodes cannot be declared here (see `KnownPlayers`).
+        let mut names: BTreeSet<String> = [
+            "region.define",
+            "region.claim",
+            "region.list",
+            "region.list.own",
+            "region.migrateheights",
+            "region.migratedb",
+            "region.migrateuuid",
+            "region.load",
+            "region.save",
+            "region.unlimited",
+            "region.toggle-bypass",
+            "flushstates",
+            "running",
+            "report",
+            "reload",
+            "god",
+            "heal",
+            "slay",
+        ]
+        .iter()
+        .map(|n| format!("worldguard.{n}"))
+        .collect();
+        for n in ["god", "heal", "slay"] {
+            names.insert(format!("worldguard.{n}.other"));
+        }
+        for n in [
+            "stack",
+            "profile",
+            "halt-activity",
+            "fire-toggle.stop",
+            "report.pastebin",
+            "debug.event",
+            "notify",
+            "chest-protection.override",
+            "override.chest-protection",
+            "override.lighter",
+        ] {
+            names.insert(format!("worldguard.{n}"));
+        }
+        // `worldguard.region.bypass.<world>`: one per world the config names.
+        let mut worlds: BTreeSet<String> = ["world", "world_nether", "world_the_end"].iter().map(|w| (*w).to_owned()).collect();
+        worlds.extend(lock(&self.st).guard.cfg.worlds.values().cloned());
+        for w in worlds {
+            names.insert(format!("worldguard.region.bypass.{w}"));
+        }
+        // `/rg` subcommands: `worldguard.region.<sub>` and its `.own` / `.member` forms.
+        for sub in commands::usages().iter().filter_map(|u| u.split_whitespace().next()) {
+            for tail in ["", ".own", ".member"] {
+                names.insert(format!("worldguard.region.{sub}{tail}"));
+            }
+        }
+        for name in names {
+            let _ = event.nodes.add(perm_node(&name), NodeDefault::Level(PermissionLevel::from_level(2)));
+        }
+    }
+
     fn register_configs(&self, _: HostSide, event: &mut RegisterConfigsEvent<'_>) {
         event
             .configs
@@ -952,7 +1530,10 @@ impl Hooks for Mod {
         }
         // `/wg` and the general commands are level 0 too: every path checks its node in
         // `command_lines` (wg_node / general_command) before anything runs.
-        for root in ["wg", "worldguard", "god", "ungod", "heal", "slay"] {
+        for root in [
+            "wg", "worldguard", "god", "ungod", "heal", "slay", "stopfire", "allowfire", "halt-activity", "stoplag",
+            "haltactivity", "stack",
+        ] {
             event.commands.push(Command::new(root));
             event
                 .commands
@@ -970,7 +1551,8 @@ impl Hooks for Mod {
         };
         if !matches!(
             root.as_str(),
-            "rg" | "region" | "regions" | "wg" | "worldguard" | "god" | "ungod" | "heal" | "slay"
+            "rg" | "region" | "regions" | "wg" | "worldguard" | "god" | "ungod" | "heal" | "slay" | "stopfire"
+                | "allowfire" | "halt-activity" | "stoplag" | "haltactivity" | "stack"
         ) {
             return Flow::Continue;
         }
@@ -1006,6 +1588,10 @@ impl Hooks for Mod {
         ) {
             return;
         }
+        // `worldguard.region.bypass.<world>`, asked once a second, before the lock is taken.
+        if lock(&self.st).ticks % TPS == 0 {
+            self.refresh_bypass(&mut *host);
+        }
         let mut st = lock(&self.st);
         st.load_all(&*host);
         st.ticks += 1;
@@ -1022,6 +1608,8 @@ impl Hooks for Mod {
         let mut titles: Vec<(u128, String, String)> = Vec::new();
         let mut pushes: Vec<(u128, String, [f64; 3], f32, f32)> = Vec::new();
         let mut ops_notes: Vec<String> = Vec::new();
+        let mut vital_changes: Vec<(u128, Change)> = Vec::new();
+        let now_ms = st.ticks * 1000 / TPS;
         for np in &players {
             let p = st.player(np);
             let world = st.guard.cfg.world_of(&p.dimension);
@@ -1037,7 +1625,15 @@ impl Hooks for Mod {
                     },
                 )
             };
-            let State { guard, tracker, .. } = &mut *st;
+            let max_health = host
+                .living(np.player.entity())
+                .and_then(|l| l.max_health(&*host))
+                .unwrap_or(20.0);
+            let food = np.player.food(&*host).map_or(20, |f| f.level);
+            let State { guard, tracker, vitals, .. } = &mut *st;
+            for c in vitals.step(guard, &p, np.health, max_health, food, now_ms) {
+                vital_changes.push((np.uuid, c));
+            }
             // Backstop: this tick's check pushes back what `player_move` did not refuse (PORT_NOTES.md).
             let events = tracker.update(
                 guard,
@@ -1063,6 +1659,35 @@ impl Hooks for Mod {
                 }
             }
         }
+        // One position a second per player, the last four: where `teleport-on-void-falling` and
+        // `teleport-on-suffocation` put a player back.
+        let online_set: HashSet<u128> = players.iter().map(|p| p.uuid).collect();
+        st.trail.retain(|u, _| online_set.contains(u));
+        if st.ticks % TPS == 0 {
+            for np in &players {
+                if np.position[1] > -60.0 {
+                    let t = st.trail.entry(np.uuid).or_default();
+                    t.push_back((np.dimension.clone(), np.position));
+                    while t.len() > 4 {
+                        t.pop_front();
+                    }
+                }
+            }
+        }
+        for uuid in std::mem::take(&mut st.rescues) {
+            let Some(np) = st.by_uuid.get(&uuid).cloned() else { continue };
+            if let Some((dim, pos)) = st.trail.get(&uuid).and_then(|t| t.front().cloned()) {
+                pushes.push((uuid, dim, pos, np.yaw, np.pitch));
+            }
+        }
+        // `simulation.sponge`: the water around a sponge that was placed.
+        for (dim, at) in std::mem::take(&mut st.sponge_clears) {
+            let r = st.guard.sponge_radius(&dim);
+            st.commands.push(format!(
+                "execute in {dim} run fill {} {} {} {} {} {} minecraft:air replace minecraft:water",
+                at[0] - r, at[1] - r, at[2] - r, at[0] + r, at[1] + r, at[2] + r
+            ));
+        }
         let cmds = std::mem::take(&mut st.commands);
         let op_level = st.guard.cfg.op_level;
         if st.save_at.is_some_and(|t| st.ticks >= t) {
@@ -1072,6 +1697,20 @@ impl Hooks for Mod {
         drop(st);
         for (u, dim, to, yaw, pitch) in pushes {
             teleport(host, u, &dim, to, yaw, pitch);
+        }
+        for (u, change) in vital_changes {
+            let Some(player) = host.player(u) else { continue };
+            match change {
+                Change::Health(h) => {
+                    if let Some(living) = host.living(player.entity()) {
+                        let _ = living.set_health(&mut *host, h);
+                    }
+                }
+                Change::Food(n) => {
+                    let _ = player.set_food_level(&mut *host, n);
+                    let _ = player.set_saturation(&mut *host, n as f32);
+                }
+            }
         }
         for c in cmds {
             if !host.commands().run_command(&c) {
@@ -1134,6 +1773,8 @@ impl Hooks for Mod {
         let mut st = lock(&self.st);
         st.tracker.forget(event.player);
         st.god.remove(&event.player);
+        st.vitals.forget(event.player);
+        st.bypass.remove(&event.player);
     }
 
     // -- blocks ----------------------------------------------------------------------------
@@ -1148,12 +1789,36 @@ impl Hooks for Mod {
         let st = lock(&self.st);
         let p = st.player(&np);
         match st.guard.break_block(&p, bp(event.pos)) {
-            Ok(()) => Flow::Continue,
+            Ok(()) => {
+                // `exp-drops`: the block part's `exp_drop` hook is per block, so the global `break_block`
+                // sample override stands in for it.
+                if !st.guard.exp_drops(&p.dimension, bp(event.pos)) {
+                    *event.exp_to_drop = Some(0);
+                }
+            }
             Err(d) => {
                 drop(st);
-                Self::denied(host, &p, &d.message)
+                return Self::denied(host, &p, &d.message);
             }
         }
+        drop(st);
+        if self.chest_locked(host, &p, event.pos) {
+            return Self::denied(host, &p, "&4This chest is protected.");
+        }
+        // The blacklist: `on-break` for the block, `on-destroy-with` for the tool in hand.
+        let block = event.state.block().id(&*host).to_string();
+        if !self.blacklist_check(host, &p, EventType::Break, &block, false) {
+            return Flow::Cancel;
+        }
+        let tool = host
+            .living(ap.entity())
+            .and_then(|l| l.hand_item(&*host, Hand::Main))
+            .map(|s| s.item().id(&*host).to_string())
+            .unwrap_or_default();
+        if !self.blacklist_check(host, &p, EventType::DestroyWith, &tool, false) {
+            return Flow::Cancel;
+        }
+        Flow::Continue
     }
 
     /// `right_click_block` also carries the item the click holds, so the wand and the item rule
@@ -1199,16 +1864,24 @@ impl Hooks for Mod {
             return Self::denied(host, &p, &d.message);
         }
         // A block item is checked by `entity_place`, where it would place.
-        match st
+        if let Err(d) = st
             .guard
             .use_item_on(&p, bp(click.pos), click.hit.face, &item, &block)
         {
-            Ok(()) => Flow::Continue,
-            Err(d) => {
-                drop(st);
-                Self::denied(host, &p, &d.message)
-            }
+            drop(st);
+            return Self::denied(host, &p, &d.message);
         }
+        drop(st);
+        if self.chest_locked(host, &p, click.pos) {
+            return Self::denied(host, &p, "&4This chest is protected.");
+        }
+        // The blacklist: `on-interact` for the block clicked, `on-use` for the item in hand.
+        if !self.blacklist_check(host, &p, EventType::Interact, &block, false)
+            || !self.blacklist_check(host, &p, EventType::Use, &item, false)
+        {
+            return Flow::Cancel;
+        }
+        Flow::Continue
     }
 
     /// Before a block item places (`entity_place`): a cancel places nothing and uses nothing up.
@@ -1227,7 +1900,30 @@ impl Hooks for Mod {
             return Flow::Continue;
         };
         let pos = bp_of([event.pos.x, event.pos.y, event.pos.z]);
-        self.player_check(host, uuid, |g, p| g.place_block(p, pos))
+        if matches!(self.player_check(host, uuid, |g, p| g.place_block(p, pos)), Flow::Cancel) {
+            return Flow::Cancel;
+        }
+        let Some(p) = lock(&self.st).cached(uuid) else {
+            return Flow::Continue;
+        };
+        let at = [event.pos.x, event.pos.y, event.pos.z];
+        let block = event.state.block().id(&*host).to_string();
+        let short = block.strip_prefix("minecraft:").unwrap_or(&block);
+        // `chest-protection`: no chest on a spot a lock sign claims.
+        if wg::chest::is_chest(&block) && self.chest_locked(host, &p, at) {
+            return Self::denied(host, &p, "&4This spot is for a chest that you don't have permission for.");
+        }
+        if !self.blacklist_check(host, &p, EventType::Place, &block, false) {
+            return Flow::Cancel;
+        }
+        // `simulation.sponge`: the water around a new sponge goes at the next tick.
+        if short == "sponge" {
+            let mut st = lock(&self.st);
+            if st.guard.sponge_enabled(&p.dimension) {
+                st.sponge_clears.push((p.dimension.clone(), at));
+            }
+        }
+        Flow::Continue
     }
 
     fn bucket_empty(&self, host: &mut dyn ServerHost, event: &mut BucketEmptyEvent<'_>) -> Flow {
@@ -1313,8 +2009,21 @@ impl Hooks for Mod {
             }
         }
         let blast = Blast::from_kind(best.as_ref().map(|(_, k)| k.as_str()));
+        if blast == Blast::WindCharge {
+            // `wind-charge-burst`: what stands in a region that denies it is neither hurt nor pushed.
+            let dimension = event.dimension;
+            event.entities.retain(|e| {
+                e.position(&*host)
+                    .is_none_or(|pos| st.guard.wind_burst_pushes(dimension, BlockPos::of(pos)))
+            });
+        }
         st.guard
             .explosion(event.dimension, event.center, blast, &mut *event.blocks);
+        // `chest-protection`: a blast does not break a locked chest (or its sign).
+        if st.guard.rule(event.dimension, "chest-protection.enable") {
+            let reader = chest_world::HostReader { host: &*host, dimension: event.dimension };
+            event.blocks.retain(|b| !wg::chest::is_protected(&reader, *b, None));
+        }
     }
 
     fn piston_pre(&self, _level: &dyn LevelHost, event: &mut PistonPreEvent<'_>) -> Flow {
@@ -1339,29 +2048,82 @@ impl Hooks for Mod {
         }
     }
 
-    fn block_spread(&self, _level: &dyn LevelHost, event: &mut BlockSpreadEvent<'_>) -> Flow {
+    fn block_spread(&self, level: &dyn LevelHost, event: &mut BlockSpreadEvent<'_>) -> Flow {
         let st = lock(&self.st);
         let dim = dim_id(&event.dimension);
         let (from, to) = (
             bp_of([event.from.x, event.from.y, event.from.z]),
             bp_of([event.to.x, event.to.y, event.to.z]),
         );
+        let to_at = [event.to.x, event.to.y, event.to.z];
         let ok = if event.kind == "fire" {
-            st.guard.fire_spread(&dim, to)
+            // `fire.disable-fire-spread-blocks`: not onto a spot with one of those below or beside it.
+            let around = || {
+                [[0, -1, 0], [1, 0, 0], [-1, 0, 0], [0, 0, -1], [0, 0, 1]]
+                    .iter()
+                    .map(|d| level_block(level, [to_at[0] + d[0], to_at[1] + d[1], to_at[2] + d[2]]))
+                    .collect::<Vec<_>>()
+            };
+            st.guard.fire_spread(&dim, to) && !st.guard.fire_blocked_by(&dim, &around())
         } else {
-            // TODO(arismoko-api: fluid_kind_in_spread): which fluid is not told, so water-flow and
-            // lava-flow both apply to any fluid.
-            st.guard.fluid_flow(&dim, "water", from, to)
-                && st.guard.fluid_flow(&dim, "lava", from, to)
+            let from_block = level_block(level, [event.from.x, event.from.y, event.from.z]);
+            let to_block = level_block(level, to_at);
+            let below = || level_block(level, [to_at[0], to_at[1] - 1, to_at[2]]);
+            let f = from_block.strip_prefix("minecraft:").unwrap_or(&from_block);
+            // The fluid is told from the block it flows out of: `water-flow` and `lava-flow` apply
+            // to their own fluid (both when the source block is neither).
+            let flag_ok = match f {
+                "water" | "bubble_column" => st.guard.fluid_flow(&dim, "water", from, to),
+                "lava" => st.guard.fluid_flow(&dim, "lava", from, to),
+                _ => st.guard.fluid_flow(&dim, "water", from, to) && st.guard.fluid_flow(&dim, "lava", from, to),
+            };
+            flag_ok && st.guard.fluid_into(&dim, &from_block, &to_block, &below) && {
+                // `simulation.sponge`: water does not flow into the reach of a sponge.
+                !(matches!(f, "water" | "bubble_column")
+                    && st.guard.sponge_enabled(&dim)
+                    && {
+                        let r = st.guard.sponge_radius(&dim);
+                        let redstone = st.guard.sponge_redstone(&dim);
+                        // gap(has_neighbor_signal): the block_spread hook gets a LevelHost, which has no signal reads
+                        // (LevelTicksHost does, for the tick hooks). Until a level handle reaches this hook, no sponge
+                        // reads as powered, so a redstone-gated sponge absorbs like a plain one.
+                        let powered = |_at: [i32; 3]| false;
+                        let mut found = false;
+                        'scan: for dx in -r..=r {
+                            for dy in -r..=r {
+                                for dz in -r..=r {
+                                    let at = [to_at[0] + dx, to_at[1] + dy, to_at[2] + dz];
+                                    if level_block(level, at) == "minecraft:sponge"
+                                        && (!redstone || !powered(at))
+                                    {
+                                        found = true;
+                                        break 'scan;
+                                    }
+                                }
+                            }
+                        }
+                        found
+                    })
+            }
         };
         if ok { Flow::Continue } else { Flow::Cancel }
     }
 
-    fn block_ignite(&self, _level: &dyn LevelHost, event: &mut BlockIgniteEvent<'_>) -> Flow {
+    fn block_ignite(&self, level: &dyn LevelHost, event: &mut BlockIgniteEvent<'_>) -> Flow {
         let st = lock(&self.st);
         let dim = dim_id(&event.dimension);
         let p = event.player.and_then(|u| st.cached(u));
         let at = bp_of([event.pos.x, event.pos.y, event.pos.z]);
+        if p.is_none() && event.cause.to_ascii_lowercase().contains("spread") {
+            let (x, y, z) = (event.pos.x, event.pos.y, event.pos.z);
+            let around: Vec<String> = [[0, -1, 0], [1, 0, 0], [-1, 0, 0], [0, 0, -1], [0, 0, 1]]
+                .iter()
+                .map(|d| level_block(level, [x + d[0], y + d[1], z + d[2]]))
+                .collect();
+            if st.guard.fire_blocked_by(&dim, &around) {
+                return Flow::Cancel;
+            }
+        }
         match st.guard.ignite(p.as_ref(), &dim, at, event.cause) {
             Ok(()) => Flow::Continue,
             Err(d) => {
@@ -1375,13 +2137,125 @@ impl Hooks for Mod {
         }
     }
 
-    fn block_burn(&self, _level: &dyn LevelHost, event: &mut BlockBurnEvent) -> Flow {
+    fn block_burn(&self, level: &dyn LevelHost, event: &mut BlockBurnEvent) -> Flow {
         let st = lock(&self.st);
         let at = bp_of([event.pos.x, event.pos.y, event.pos.z]);
-        if st.guard.burn(&dim_id(&event.dimension), at) {
+        let dim = dim_id(&event.dimension);
+        let block = level_block(level, [event.pos.x, event.pos.y, event.pos.z]);
+        if st.guard.burn(&dim, at) && st.guard.burnable(&dim, &block) {
             Flow::Continue
         } else {
             Flow::Cancel
+        }
+    }
+
+    /// `ice-melt`, `snow-melt`, `soil-dry`, `coral-fade`, `copper-fade` and their world options.
+    fn block_fade(&self, level: &dyn LevelHost, event: &mut BlockFadeEvent) -> Flow {
+        let from = state_name(level, event.from);
+        let at = bp_of([event.pos.x, event.pos.y, event.pos.z]);
+        if lock(&self.st).guard.block_fade(&dim_id(&event.dimension), at, &from) {
+            Flow::Continue
+        } else {
+            Flow::Cancel
+        }
+    }
+
+    /// `ice-form`, `snow-fall`, `frosted-ice-form`, `dynamics.snow-fall-blocks` and the world options.
+    fn block_form(&self, level: &dyn LevelHost, event: &mut BlockFormEvent) -> Flow {
+        let to = state_name(level, event.to);
+        let at = bp_of([event.pos.x, event.pos.y, event.pos.z]);
+        let below = || level_block(level, [event.pos.x, event.pos.y - 1, event.pos.z]);
+        if lock(&self.st).guard.block_form(&dim_id(&event.dimension), at, &to, &below) {
+            Flow::Continue
+        } else {
+            Flow::Cancel
+        }
+    }
+
+    /// `mushroom-growth` (and `dynamics.disable-mushroom-spread`) for a huge mushroom growing.
+    fn block_grow_feature(&self, _level: &mut dyn LevelRandomHost, event: &mut BlockGrowFeatureEvent<'_>) -> Flow {
+        let Some(feature) = event.feature.as_deref() else {
+            return Flow::Continue;
+        };
+        let at = bp_of([event.pos.x, event.pos.y, event.pos.z]);
+        if lock(&self.st).guard.block_grow(&dim_id(&event.dimension), at, feature) {
+            Flow::Continue
+        } else {
+            Flow::Cancel
+        }
+    }
+
+    /// `weather.disable-weather`, `disable-thunderstorm`, `always-raining`, `always-thundering`.
+    fn weather_change(&self, _host: &mut dyn ServerHost, event: &mut WeatherChangeEvent<'_>) -> Flow {
+        let mut st = lock(&self.st);
+        let now = (event.raining, event.thundering);
+        let was = st.weather.get(event.dimension).copied().unwrap_or((false, false));
+        if st.guard.weather_change(event.dimension, was, now) {
+            st.weather.insert(event.dimension.to_owned(), now);
+            Flow::Continue
+        } else {
+            Flow::Cancel
+        }
+    }
+
+    /// `weather.disable-pig-zombification`, `disable-villager-witchification`, `disable-powered-creepers`.
+    /// A cancel also spares the animal the bolt's damage, which WorldGuard's own events do not.
+    fn entity_struck_by_lightning(&self, host: &mut dyn ServerHost, event: &mut EntityStruckByLightningEvent) -> Flow {
+        let Some(kind) = event.entity.kind(&*host).map(|k| k.id(&*host).to_string()) else {
+            return Flow::Continue;
+        };
+        let dimension = event
+            .entity
+            .level(&*host)
+            .map(|l| l.dimension_id().to_string())
+            .unwrap_or_else(|| OVERWORLD.to_owned());
+        if lock(&self.st).guard.zap_allowed(&dimension, &kind) {
+            Flow::Continue
+        } else {
+            Flow::Cancel
+        }
+    }
+
+    /// `chest-protection` and `chest-protection.disable-off-check`: a `[Lock]` sign is checked when it is written.
+    fn sign_changed(&self, host: &mut dyn ServerHost, event: &mut SignChangedEvent<'_>) -> Flow {
+        if !event.front || !event.lines.first().is_some_and(|l| l.eq_ignore_ascii_case("[Lock]")) {
+            return Flow::Continue;
+        }
+        let (enabled, off_check_disabled) = {
+            let st = lock(&self.st);
+            (
+                st.guard.rule(event.dimension, "chest-protection.enable"),
+                st.guard.rule(event.dimension, "chest-protection.disable-off-check"),
+            )
+        };
+        let uuid = event.player;
+        let (x, y, z) = (event.pos[0], event.pos[1], event.pos[2]);
+        let outcome: Result<&'static str, &'static str> = if enabled {
+            let overridden = may(host, uuid, "worldguard.chest-protection.override", 0)
+                || may(host, uuid, "worldguard.override.chest-protection", 0);
+            let reader = chest_world::HostReader { host: &*host, dimension: event.dimension };
+            let protected_here =
+                !overridden && wg::chest::is_protected_placement(&reader, event.pos, Some(event.name));
+            wg::chest::check_lock_sign(&reader, event.pos, event.name, event.lines, protected_here)
+        } else if !off_check_disabled {
+            Err("WorldGuard's sign chest protection is disabled.")
+        } else {
+            return Flow::Continue;
+        };
+        match outcome {
+            Ok(msg) => {
+                event.lines[0] = "[Lock]".to_owned();
+                tell(host, uuid, &format!("&e{msg}"));
+                Flow::Continue
+            }
+            Err(msg) => {
+                tell(host, uuid, &format!("&c{msg}"));
+                // `breakNaturally`: the sign goes and drops itself.
+                lock(&self.st)
+                    .commands
+                    .push(format!("execute in {} run setblock {x} {y} {z} minecraft:air destroy", event.dimension));
+                Flow::Cancel
+            }
         }
     }
 
@@ -1392,6 +2266,175 @@ impl Hooks for Mod {
             Flow::Continue
         } else {
             Flow::Cancel
+        }
+    }
+
+    // -- flags that name one event ---------------------------------------------------------
+
+    /// `block-trampling`: a landing about to turn farmland to dirt or break an egg.
+    fn entity_change_block_pre(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut EntityChangeBlockPreEvent<'_>,
+    ) -> Flow {
+        let block = event.from.block().id(&*host).to_string();
+        if !matches!(
+            block.strip_prefix("minecraft:").unwrap_or(&block),
+            "farmland" | "turtle_egg" | "sniffer_egg"
+        ) {
+            return Flow::Continue;
+        }
+        let pos = bp(event.pos);
+        if let Some(uuid) = event.player {
+            let Some(np) = host.player(uuid).and_then(|p| snap(&*host, p)) else {
+                return Flow::Continue;
+            };
+            let st = lock(&self.st);
+            let p = st.player(&np);
+            return if st.guard.trample_by_player(&p, pos, &block).is_ok() {
+                Flow::Continue
+            } else {
+                Flow::Cancel
+            };
+        }
+        let dimension = event
+            .entity
+            .and_then(|id| host.entity(id))
+            .and_then(|e| e.level(&*host))
+            .map(|l| l.dimension_id().to_string())
+            .unwrap_or_else(|| OVERWORLD.to_owned());
+        if lock(&self.st).guard.trample_by_mob(&dimension, pos, &block) {
+            Flow::Continue
+        } else {
+            Flow::Cancel
+        }
+    }
+
+    /// `enderman-grief`, `snowman-trails`, `ravager-grief` (and the two world options): the mob is
+    /// told it may not change blocks. The block it would change is not given, so the mob's own
+    /// position decides.
+    fn entity_mob_griefing(&self, host: &dyn Host, event: &mut EntityMobGriefingEvent) {
+        if !event.can_grief {
+            return;
+        }
+        let Some(kind) = event.entity.kind(host).map(|k| k.id(host).to_string()) else {
+            return;
+        };
+        if !matches!(
+            kind.strip_prefix("minecraft:").unwrap_or(&kind),
+            "enderman" | "snow_golem" | "ravager"
+        ) {
+            return;
+        }
+        let Some(pos) = event.entity.position(host) else {
+            return;
+        };
+        let dimension = event
+            .entity
+            .level(host)
+            .map(|l| l.dimension_id().to_string())
+            .unwrap_or_else(|| OVERWORLD.to_owned());
+        if !lock(&self.st).guard.mob_may_grief(&dimension, &kind, BlockPos::of(pos)) {
+            event.can_grief = false;
+        }
+    }
+
+    /// `crop-growth`.
+    fn crop_grow_pre(&self, _level: &mut dyn LevelRandomHost, event: &mut CropGrowPreEvent<'_>) {
+        let at = bp_of([event.pos.x, event.pos.y, event.pos.z]);
+        if !lock(&self.st).guard.crop_grows(&dim_id(&event.dimension), at) {
+            *event.result = TriState::False;
+        }
+    }
+
+    /// `moisture-change`.
+    fn moisture_change(&self, _level: &dyn LevelHost, event: &mut MoistureChangeEvent) -> Flow {
+        let at = bp_of([event.pos.x, event.pos.y, event.pos.z]);
+        if lock(&self.st).guard.moisture_changes(&dim_id(&event.dimension), at) {
+            Flow::Continue
+        } else {
+            Flow::Cancel
+        }
+    }
+
+    /// `lava-harden`: any fluid placing a block (cobblestone, stone, basalt, obsidian) counts.
+    fn fluid_place_block(&self, _level: &dyn LevelHost, event: &mut FluidPlaceBlockEvent<'_>) -> Flow {
+        let at = bp_of([event.pos.x, event.pos.y, event.pos.z]);
+        if lock(&self.st).guard.lava_hardens(&dim_id(&event.dimension), at) {
+            Flow::Continue
+        } else {
+            Flow::Cancel
+        }
+    }
+
+
+    /// `exp-drops` for the experience of a dying mob or player.
+    fn living_experience_drop(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut LivingExperienceDropEvent<'_>,
+    ) -> Flow {
+        let Some(entity) = host.entity(event.entity) else {
+            return Flow::Continue;
+        };
+        let Some(pos) = entity.position(&*host) else {
+            return Flow::Continue;
+        };
+        let dimension = entity
+            .level(&*host)
+            .map(|l| l.dimension_id().to_string())
+            .unwrap_or_else(|| OVERWORLD.to_owned());
+        if lock(&self.st).guard.exp_drops(&dimension, BlockPos::of(pos)) {
+            Flow::Continue
+        } else {
+            Flow::Cancel
+        }
+    }
+
+    /// `natural-health-regen`. The event does not say why the entity heals; natural regeneration
+    /// heals at most one point at a time, so only heals of one point or less are held back
+    /// (HMOD-GAP(heal_cause): a Regeneration effect is held back too).
+    fn living_heal(&self, _context: &dyn LoopContext, event: &mut LivingHealEvent) -> Flow {
+        if event.amount > 1.0 {
+            return Flow::Continue;
+        }
+        let st = lock(&self.st);
+        let Some(p) = st.by_entity.get(&(event.entity as i32)).map(|s| st.player(s)) else {
+            return Flow::Continue;
+        };
+        if st.guard.natural_regen(&p) {
+            Flow::Continue
+        } else {
+            Flow::Cancel
+        }
+    }
+
+    /// `natural-hunger-drain`: only a drop of the food level (eating raises it).
+    fn food_level_changed(
+        &self,
+        _host: &mut dyn ServerHost,
+        event: &mut FoodLevelChangedEvent<'_>,
+    ) -> Flow {
+        if event.to > event.from {
+            return Flow::Continue;
+        }
+        let st = lock(&self.st);
+        let Some(p) = st.cached(event.player) else {
+            return Flow::Continue;
+        };
+        if st.guard.natural_hunger(&p) {
+            Flow::Continue
+        } else {
+            Flow::Cancel
+        }
+    }
+
+    /// `/halt-activity`: no explosions.
+    fn explosion_start(&self, _host: &mut dyn ServerHost, _event: &mut ExplosionStartEvent<'_>) -> Flow {
+        if lock(&self.st).guard.activity_halted {
+            Flow::Cancel
+        } else {
+            Flow::Continue
         }
     }
 
@@ -1423,16 +2466,16 @@ impl Hooks for Mod {
         }
     }
 
-    fn entity_interact(
-        &self,
-        host: &mut dyn ServerHost,
-        event: &mut EntityInteractEvent<'_>,
-    ) -> Flow {
+    // A cancel is answered as `InteractionResult::Fail` (the hook's own refusal; the old `Flow::Cancel`).
+    fn entity_interact(&self, host: HostSide, event: &mut EntityInteractEvent<'_>) -> Option<InteractionResult> {
+        let HostSide::Server(host) = host else {
+            return None;
+        };
         let Some(ap) = host.players().acting_player() else {
-            return Flow::Continue;
+            return None;
         };
         let Some(np) = snap(&*host, ap) else {
-            return Flow::Continue;
+            return None;
         };
         let at = host
             .entity(event.entity as u32)
@@ -1441,10 +2484,11 @@ impl Hooks for Mod {
         let st = lock(&self.st);
         let p = st.player(&np);
         match st.guard.interact_entity(&p, event.kind, at) {
-            Ok(()) => Flow::Continue,
+            Ok(()) => None,
             Err(d) => {
                 drop(st);
-                Self::denied(host, &p, &d.message)
+                let _ = Self::denied(host, &p, &d.message);
+                Some(InteractionResult::Fail)
             }
         }
     }
@@ -1464,6 +2508,14 @@ impl Hooks for Mod {
     }
 
     fn entity_mount(&self, host: &mut dyn ServerHost, event: &mut EntityMountEvent<'_>) -> Flow {
+        if event.mounting
+            && event.kind != "minecraft:player"
+            && wg::kinds::is_vehicle(event.vehicle_kind)
+            && lock(&self.st).guard.vehicle_entry_blocked(event.dimension)
+        {
+            // `mobs.block-vehicle-entry`
+            return Flow::Cancel;
+        }
         if !event.mounting || event.kind != "minecraft:player" {
             return Flow::Continue;
         }
@@ -1484,6 +2536,17 @@ impl Hooks for Mod {
         _level: &mut dyn LevelRandomHost,
         event: &mut LivingIncomingDamageEvent<'_>,
     ) -> Flow {
+        if event.kind == "minecraft:armor_stand" {
+            // `mobs.block-armor-stand-destroy`: what is not a player's blow. The event names no
+            // dimension, so the overworld's option decides.
+            let st = lock(&self.st);
+            let by_player = st.by_entity.contains_key(&event.source.causing);
+            return if !by_player && st.guard.armor_stand_hit_blocked(OVERWORLD) {
+                Flow::Cancel
+            } else {
+                Flow::Continue
+            };
+        }
         if event.kind != "minecraft:player" {
             return Flow::Continue;
         }
@@ -1498,6 +2561,13 @@ impl Hooks for Mod {
         let Some(victim) = st.by_entity.get(&event.entity).map(|v| st.player(v)) else {
             return Flow::Continue;
         };
+        if st.guard.damage_rescues(&victim, event.source.damage_type) {
+            // `teleport-on-void-falling` / `teleport-on-suffocation`: no damage, and the next tick moves the player.
+            let uuid = victim.subject.uuid;
+            drop(st);
+            lock(&self.st).rescues.push(uuid);
+            return Flow::Cancel;
+        }
         let causing = event.source.causing;
         let attacker = st.by_entity.get(&causing).map(|a| st.player(a));
         let by_mob = causing != 0 && attacker.is_none() && causing != event.entity;
@@ -1513,11 +2583,21 @@ impl Hooks for Mod {
 
     fn entity_join_level(
         &self,
-        _host: &mut dyn ServerHost,
+        host: &mut dyn ServerHost,
         event: &mut EntityJoinLevelEvent<'_>,
     ) -> Flow {
         let mut st = lock(&self.st);
         let k = event.kind.strip_prefix("minecraft:").unwrap_or(event.kind);
+        if k == "lightning_bolt" {
+            // `weather.prevent-lightning-strike-blocks` and the `lightning` flag.
+            let at = [event.pos[0].floor() as i32, event.pos[1].floor() as i32, event.pos[2].floor() as i32];
+            let block = host_block(&*host, event.dimension, at);
+            let below = host_block(&*host, event.dimension, [at[0], at[1] - 1, at[2]]);
+            if !st.guard.lightning_strikes(event.dimension, bp(at), &block, &below) {
+                return Flow::Cancel;
+            }
+            return Flow::Continue;
+        }
         if matches!(
             k,
             "tnt"
@@ -1541,6 +2621,10 @@ impl Hooks for Mod {
         if event.loaded_from_disk {
             return Flow::Continue;
         }
+        // `potion-splash` also covers the lingering clouds (and dragon breath).
+        if k == "area_effect_cloud" && !st.guard.cloud_spawns(event.dimension, BlockPos::of(event.pos)) {
+            return Flow::Cancel;
+        }
         if st.guard.mob_spawn(event.dimension, event.kind, event.pos) {
             Flow::Continue
         } else {
@@ -1561,7 +2645,7 @@ impl Hooks for Mod {
 
     fn item_picked_up(
         &self,
-        _host: &mut dyn ServerHost,
+        host: &mut dyn ServerHost,
         event: &mut ItemPickedUpEvent<'_>,
     ) {
         // Upstream made this a listener with `can_pickup` (NeoForge's ItemEntityPickupEvent.Pre): False leaves it.
@@ -1571,13 +2655,39 @@ impl Hooks for Mod {
         };
         if st.guard.item_pickup(&p).is_err() {
             *event.can_pickup = TriState::False;
+            return;
+        }
+        drop(st);
+        // `on-acquire` of the blacklist, silent as WorldGuard asks it for a pickup.
+        let item = event
+            .item
+            .stack(&*host)
+            .map(|s| s.item().id(&*host).to_string())
+            .unwrap_or_default();
+        if !self.blacklist_check(host, &p, EventType::Acquire, &item, true) {
+            *event.can_pickup = TriState::False;
         }
     }
 
     /// `item-drop`: a cancel puts the stack back.
-    fn item_toss(&self, host: &mut dyn ServerHost, event: &mut ItemTossEvent<'_>) -> Flow {
+    fn item_toss(&self, host: &mut dyn ServerHost, event: &mut ItemTossEvent) -> Flow {
         let uuid = event.player;
-        self.player_check(host, uuid, |g, p| g.item_drop(p))
+        if matches!(self.player_check(host, uuid, |g, p| g.item_drop(p)), Flow::Cancel) {
+            return Flow::Cancel;
+        }
+        let item = event
+            .item
+            .stack(&*host)
+            .map(|s| s.item().id(&*host).to_string())
+            .unwrap_or_default();
+        let Some(p) = lock(&self.st).cached(uuid) else {
+            return Flow::Continue;
+        };
+        if self.blacklist_check(host, &p, EventType::Drop, &item, false) {
+            Flow::Continue
+        } else {
+            Flow::Cancel
+        }
     }
 
     fn ender_pearl_teleport(
@@ -1659,8 +2769,8 @@ impl Hooks for Mod {
         let root = command[..first_space].to_ascii_lowercase();
         let rest = &command[first_space + 1..];
         let words = match root.as_str() {
-            "rg" | "region" | "regions" => self.complete_region(&*host, event.player, rest),
-            "wg" | "worldguard" => self.complete_wg(&*host, event.player, rest),
+            "rg" | "region" | "regions" => self.complete_region(&mut *host, event.player, rest),
+            "wg" | "worldguard" => self.complete_wg(&mut *host, event.player, rest),
             _ => return,
         };
         let word_start = command.rfind(' ').map_or(0, |i| i + 1);

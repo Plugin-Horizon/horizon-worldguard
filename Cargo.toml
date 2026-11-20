@@ -5,6 +5,13 @@ edition = "2024"
 publish = false
 
 [dependencies]
-# The launcher (or stage.py) points this at the Horizon source the game is built from.
-horizon-mod-api = { git = "https://github.com/arismoko/horizon" }
-worldguard-core = { path = "core" }
+# The pinned SDK's API crate, fetched into .horizon/sdk/ by any `cargo horizon-mod` command.
+horizon-mod-api = { path = ".horizon/sdk/api/crates/horizon-mod-api" }
+toml = "=1.1.6"
+
+[features]
+# `permission_declare_node` (horizon-rust, branch api-permission_late_node_registration, issue #18807): a region-scoped
+# node (`worldguard.region.<perm>.<id>`) is declared the first time it is asked. Off by default: the pinned SDK does
+# not have the host method yet.
+horizon_late_permission_nodes = []
+
