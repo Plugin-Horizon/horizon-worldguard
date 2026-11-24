@@ -659,8 +659,11 @@ impl Mod {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs());
+                let pattern = guard.cfg.text_in(&world, "blacklist.logging.file.path", wg::blacklist::LOG_FILE_PATTERN);
+                // Keep the file under the data folder: no absolute path, no `..`.
+                let pattern = if pattern.starts_with('/') || pattern.contains("..") { wg::blacklist::LOG_FILE_PATTERN } else { pattern };
                 for l in &verdict.log {
-                    if let Some(path) = wg::blacklist::log_file_path(wg::blacklist::LOG_FILE_PATTERN, &world, Some(&p.subject.name), now) {
+                    if let Some(path) = wg::blacklist::log_file_path(pattern, &world, Some(&p.subject.name), now) {
                         append_log_line(&dir.join(path), &wg::blacklist::log_file_line(&p.subject.name, l, now));
                     }
                 }

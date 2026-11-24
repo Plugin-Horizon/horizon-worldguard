@@ -143,6 +143,7 @@ pub struct WorldRules {
     pub rules: BTreeMap<String, bool>,
     pub lists: BTreeMap<String, Vec<String>>,
     pub ints: BTreeMap<String, i64>,
+    pub strings: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -187,6 +188,8 @@ pub struct Config {
     pub lists: BTreeMap<String, Vec<String>>,
     /// `section.key` -> number (`simulation.sponge.radius`).
     pub ints: BTreeMap<String, i64>,
+    /// `section.key` -> text (`blacklist.logging.file.path`, ...).
+    pub strings: BTreeMap<String, String>,
     /// World folder name -> that world's own options.
     pub world_rules: BTreeMap<String, WorldRules>,
 }
@@ -233,6 +236,16 @@ impl Config {
             .unwrap_or(default)
     }
 
+    /// A text option for the world folder `world` (`blacklist.logging.file.path`), or `default`.
+    pub fn text_in<'a>(&'a self, world: &str, key: &str, default: &'a str) -> &'a str {
+        self.world_rules
+            .get(world)
+            .and_then(|w| w.strings.get(key))
+            .or_else(|| self.strings.get(key))
+            .map(String::as_str)
+            .unwrap_or(default)
+    }
+
     /// Reads a world's own `config.yml` (WorldGuard's layout: the same sections as the common
     /// file). Every boolean, number and list of text below any key is kept under its dotted
     /// path; a text that is not valid YAML leaves the old options in place.
@@ -251,6 +264,9 @@ impl Config {
                 }
                 Value::Int(n) => {
                     out.ints.insert(prefix.to_owned(), *n);
+                }
+                Value::Str(t) => {
+                    out.strings.insert(prefix.to_owned(), t.clone());
                 }
                 Value::List(items) => {
                     let list = items.iter().filter_map(Value::to_text).map(|t| t.to_ascii_lowercase()).collect();
@@ -327,17 +343,19 @@ impl Config {
         let mut rules = BTreeMap::new();
         let mut lists = BTreeMap::new();
         let mut ints = BTreeMap::new();
+        let mut strings = BTreeMap::new();
         fn collect(
             prefix: &str,
             v: &toml::Value,
             rules: &mut BTreeMap<String, bool>,
             lists: &mut BTreeMap<String, Vec<String>>,
             ints: &mut BTreeMap<String, i64>,
+            strings: &mut BTreeMap<String, String>,
         ) {
             match v {
                 toml::Value::Table(tab) => {
                     for (k, v) in tab {
-                        collect(&format!("{prefix}.{k}"), v, rules, lists, ints);
+                        collect(&format!("{prefix}.{k}"), v, rules, lists, ints, strings);
                     }
                 }
                 toml::Value::Boolean(b) => {
@@ -345,6 +363,9 @@ impl Config {
                 }
                 toml::Value::Integer(n) => {
                     ints.insert(prefix.to_owned(), *n);
+                }
+                toml::Value::String(t) => {
+                    strings.insert(prefix.to_owned(), t.clone());
                 }
                 toml::Value::Array(a) => {
                     let list = a.iter().filter_map(|x| x.as_str().map(str::to_ascii_lowercase)).collect();
@@ -355,7 +376,7 @@ impl Config {
         }
         for section in RULE_SECTIONS {
             if let Some(v) = t.get(section) {
-                collect(section, v, &mut rules, &mut lists, &mut ints);
+                collect(section, v, &mut rules, &mut lists, &mut ints, &mut strings);
             }
         }
         let cfg = Config {
@@ -417,6 +438,7 @@ impl Config {
             rules,
             lists,
             ints,
+            strings,
             world_rules: BTreeMap::new(),
         };
         Ok(cfg)
@@ -445,6 +467,16 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_options_come_from_common_and_world_files() {
+        let mut c = Config::parse("[blacklist.logging.file]\npath = \"a/%Y.log\"\n").unwrap();
+        assert_eq!(c.text_in("world", "blacklist.logging.file.path", "d"), "a/%Y.log");
+        assert_eq!(c.text_in("world", "blacklist.logging.file.other", "d"), "d");
+        c.set_world_yaml("world", "blacklist:\n    logging:\n        file:\n            path: b/%m.log\n").unwrap();
+        assert_eq!(c.text_in("world", "blacklist.logging.file.path", "d"), "b/%m.log");
+        assert_eq!(c.text_in("nether", "blacklist.logging.file.path", "d"), "a/%Y.log");
+    }
 
     #[test]
     fn defaults_match_the_servers() {
