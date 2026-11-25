@@ -348,6 +348,20 @@ pub fn check_step(guard: &Guard, p: &Player, from: [f64; 3], _fill: &dyn Fn(&str
     refused_step(guard, &q, p, from_block, changed, false).map(|m| m.unwrap_or_default())
 }
 
+/// `onPlayerTeleport` (`usePlayerTeleports`): the `entry` and `exit` rules for a teleport (`/tp`) to `p`'s
+/// position from `from`. `same_dimension` is false for a jump to another level: only `entry` is asked there,
+/// the exit check needs both spots in one level. `exit-via-teleport` lets a teleport leave an `exit` region.
+pub fn check_teleport(guard: &Guard, p: &Player, from: [f64; 3], same_dimension: bool) -> Option<String> {
+    if !guard.cfg.enable || !guard.cfg.use_player_teleports || guard.bypasses(p) {
+        return None;
+    }
+    let q = Query::new(guard.world(&p.dimension)?);
+    let from_block = if same_dimension { BlockPos::of(from) } else { p.block() };
+    let ids = |at: BlockPos| -> Vec<String> { q.regions_at(at).iter().map(|r| r.id.clone()).collect() };
+    let changed = same_dimension && ids(from_block) != ids(p.block());
+    refused_step(guard, &q, p, from_block, changed, true).map(|m| m.unwrap_or_default())
+}
+
 /// The `entry`/`exit` rules of a step from the block `from` to `p`'s block in the same
 /// dimension. `Some(message)` when refused (the message is `None` while the two second delay
 /// since the last one has not passed); `None` lets the step through.
@@ -465,6 +479,27 @@ mod tests {
         assert_eq!(check_step(&g, &p(19.9), [19.5, 64.0, 5.0], &fill), None);
         assert_eq!(check_step(&g, &p(1.0), [-1.0, 64.0, 5.0], &fill), None);
         assert_eq!(check_step(&g, &p(11.5), [9.5, 64.0, 5.0], &fill), None);
+    }
+
+    #[test]
+    fn a_teleport_is_checked_like_a_step_and_exit_via_teleport_lets_it_leave() {
+        let mut g = guard();
+        // /tp into the vault (entry deny).
+        let msg = check_teleport(&g, &pu(31, 20.5), [-50.0, 64.0, 5.0], true);
+        assert_eq!(msg, Some(text::color_macros(&g.cfg.entry_deny_message)));
+        // Another level: the same entry rule, no exit check.
+        assert!(check_teleport(&g, &pu(32, 20.5), [-50.0, 64.0, 5.0], false).is_some());
+        // Out of a no-exit town: a teleport leaves anyway (exit-via-teleport is allowed by default), unless it is denied.
+        let town = g.world_mut("minecraft:overworld").get_mut("town").unwrap();
+        town.set_flag("exit", Some(FlagValue::State(false)));
+        assert_eq!(check_teleport(&g, &pu(33, 50.0), [5.5, 64.0, 5.0], true), None);
+        let town = g.world_mut("minecraft:overworld").get_mut("town").unwrap();
+        town.set_flag("exit-via-teleport", Some(FlagValue::State(false)));
+        assert!(check_teleport(&g, &pu(34, 50.0), [5.5, 64.0, 5.0], true).is_some());
+        // use-player-teleports = false switches it off.
+        let mut g2 = guard();
+        g2.cfg.use_player_teleports = false;
+        assert_eq!(check_teleport(&g2, &pu(35, 20.5), [-50.0, 64.0, 5.0], true), None);
     }
 
     #[test]

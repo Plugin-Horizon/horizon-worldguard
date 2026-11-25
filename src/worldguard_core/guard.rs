@@ -416,6 +416,20 @@ impl Guard {
         self.build(p, BlockPos::of(at), &["ride", "interact"], "ride that")
     }
 
+    /// `Session.isInvincible`: god mode (`/god`, `auto-invincible`) says allow, the `invincible` flag at the
+    /// player's feet says allow or deny, and any deny wins. `worldguard.god.override-regions` makes the
+    /// flag's deny not count (`InvincibilityFlag.getInvincibility`).
+    pub fn invincible(&self, victim: &Player, god: bool, override_regions: bool) -> bool {
+        let flag = match self.world(&victim.dimension) {
+            Some(w) if self.cfg.enable => {
+                let me = Actor::Player(&victim.subject);
+                Query::new(w).state(victim.block(), "invincible", &me)
+            }
+            _ => None,
+        };
+        resolve_invincibility(god, flag, override_regions)
+    }
+
     /// Damage to a player at `at`. `attacker` is another player for PvP (projectiles included),
     /// `by_mob` for mob damage.
     pub fn damage_player(
@@ -888,6 +902,39 @@ impl Guard {
         self.rule(dimension, "mobs.block-vehicle-entry")
     }
 
+    /// `gameplay.block-potions`: whether the effect `effect` (`minecraft:poison`) is on the world's blocked list.
+    /// Bukkit's old effect names (`INCREASE_DAMAGE`, `SLOW`...) are read as the current ones.
+    pub fn potion_blocked(&self, dimension: &str, effect: &str) -> bool {
+        let id = super::blacklist::norm(effect);
+        self.option_list(dimension, "gameplay.block-potions")
+            .iter()
+            .any(|e| potion_alias(&super::blacklist::norm(e)) == id)
+    }
+
+    /// `gameplay.disable-conduit-effects` (and the effect `source` `conduit`).
+    pub fn conduit_blocked(&self, dimension: &str) -> bool {
+        self.rule(dimension, "gameplay.disable-conduit-effects")
+    }
+
+    /// `mobs.anti-wolf-dumbness`: a tamed wolf takes no damage (the original asks `Wolf.isTamed`; the hook names the
+    /// tamed state of any tamable, and a wolf is the one this option is about). The void still kills it.
+    pub fn tamed_wolf_protected(&self, dimension: &str, kind: &str, tamed: Option<bool>, damage_type: &str) -> bool {
+        kind.strip_prefix("minecraft:").unwrap_or(kind) == "wolf"
+            && tamed == Some(true)
+            && damage_type.strip_prefix("minecraft:").unwrap_or(damage_type) != "out_of_world"
+            && self.rule(dimension, "mobs.anti-wolf-dumbness")
+    }
+
+    /// `protection.remove-infinite-stacks`.
+    pub fn infinite_stacks_removed(&self, dimension: &str) -> bool {
+        self.rule(dimension, "protection.remove-infinite-stacks")
+    }
+
+    /// `protection.item-durability` (default true): false means tools and armor take no wear.
+    pub fn item_durability(&self, dimension: &str) -> bool {
+        self.rule(dimension, "protection.item-durability")
+    }
+
     /// `mobs.block-zombie-door-destruction`.
     pub fn door_break_blocked(&self, dimension: &str) -> bool {
         self.rule(dimension, "mobs.block-zombie-door-destruction")
@@ -1086,6 +1133,32 @@ pub fn command_filter(permitted: Option<&[String]>, denied: Option<&[String]>, c
         blocked = !p.iter().any(|r| matches(r));
     }
     !blocked
+}
+
+/// Bukkit's legacy `PotionEffectType` names, as the game calls the effects today (`blocked-potions` lists either).
+fn potion_alias(name: &str) -> String {
+    match name {
+        "increase_damage" => "strength",
+        "slow" => "slowness",
+        "fast_digging" => "haste",
+        "slow_digging" => "mining_fatigue",
+        "jump" => "jump_boost",
+        "confusion" => "nausea",
+        "damage_resistance" => "resistance",
+        "heal" => "instant_health",
+        "harm" => "instant_damage",
+        other => other,
+    }
+    .to_owned()
+}
+
+/// The handlers' states of `Session.isInvincible`: a deny ends it, otherwise any allow counts.
+pub fn resolve_invincibility(god: bool, flag: Option<bool>, override_regions: bool) -> bool {
+    let flag = if flag == Some(false) && override_regions { None } else { flag };
+    if flag == Some(false) {
+        return false;
+    }
+    god || flag == Some(true)
 }
 
 #[cfg(test)]
@@ -1318,6 +1391,40 @@ mod tests {
     }
     fn guard_with(toml: &str) -> Guard {
         Guard::new(Config::parse(toml).unwrap())
+    }
+
+    #[test]
+    fn potions_conduit_wolves_and_stacks_follow_the_world_options() {
+        let g = guard_with(
+            "[gameplay]\nblock-potions = [\"POISON\", \"minecraft:INCREASE_DAMAGE\"]\ndisable-conduit-effects = true\n[mobs]\nanti-wolf-dumbness = true\n[protection]\nremove-infinite-stacks = true\nitem-durability = false\n",
+        );
+        let d = "minecraft:overworld";
+        assert!(g.potion_blocked(d, "minecraft:poison"));
+        assert!(g.potion_blocked(d, "minecraft:strength"));
+        assert!(!g.potion_blocked(d, "minecraft:speed"));
+        assert!(g.conduit_blocked(d));
+        assert!(g.tamed_wolf_protected(d, "minecraft:wolf", Some(true), "minecraft:mob_attack"));
+        assert!(!g.tamed_wolf_protected(d, "minecraft:wolf", Some(false), "minecraft:mob_attack"));
+        assert!(!g.tamed_wolf_protected(d, "minecraft:wolf", Some(true), "minecraft:out_of_world"));
+        assert!(!g.tamed_wolf_protected(d, "minecraft:cat", Some(true), "minecraft:mob_attack"));
+        assert!(g.infinite_stacks_removed(d) && !g.item_durability(d));
+        let plain = guard_with("");
+        assert!(!plain.potion_blocked(d, "minecraft:poison") && !plain.conduit_blocked(d));
+        assert!(!plain.tamed_wolf_protected(d, "minecraft:wolf", Some(true), "minecraft:mob_attack"));
+        assert!(!plain.infinite_stacks_removed(d) && plain.item_durability(d));
+    }
+
+    #[test]
+    fn invincibility_is_god_or_flag_and_a_deny_wins() {
+        // god alone, flag allow alone, nothing
+        assert!(resolve_invincibility(true, None, false));
+        assert!(resolve_invincibility(false, Some(true), false));
+        assert!(!resolve_invincibility(false, None, false));
+        // the flag's deny beats god mode (Session.isInvincible returns false on any DENY)
+        assert!(!resolve_invincibility(true, Some(false), false));
+        // worldguard.god.override-regions drops the deny, so god mode counts again
+        assert!(resolve_invincibility(true, Some(false), true));
+        assert!(!resolve_invincibility(false, Some(false), true));
     }
 
     #[test]

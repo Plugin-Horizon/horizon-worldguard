@@ -9,3 +9,9 @@ publish = false
 horizon-mod-api = { path = ".horizon/sdk/api/crates/horizon-mod-api" }
 toml = "=1.1.6"
 
+
+[features]
+# Code for the engine branches fam-worldguard-gameplay-cancels (mob_effect_apply_cancel, player_oversize_stack,
+# living_incoming_damage_detail) and fam-diagnostics-profiler (profiler_start/report/stop, event_trace_*), which the
+# mod SDK does not have yet. Off by default; written from the drafts, not compiled against them.
+wave2 = []
