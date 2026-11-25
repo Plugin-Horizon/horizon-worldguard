@@ -563,16 +563,16 @@ fn apply_lock(host: &mut dyn ServerHost, uuid: u128, dimension: &str, action: wg
         let Some(player) = host.player(uuid) else { return };
         match action {
             Action::Weather(r, t) => {
-                host.player_set_weather(player, if r { 1.0 } else { 0.0 }, if t { 1.0 } else { 0.0 });
+                player.set_weather(host, if r { 1.0 } else { 0.0 }, if t { 1.0 } else { 0.0 });
             }
             Action::ResetWeather => {
-                host.player_reset_weather(player);
+                player.reset_weather(host);
             }
             Action::Time(t, rel) => {
-                host.player_set_time(player, t, rel);
+                player.set_time(host, t, rel);
             }
             Action::ResetTime => {
-                host.player_reset_time(player);
+                player.reset_time(host);
             }
         }
         let _ = dimension;
@@ -1355,7 +1355,7 @@ impl Mod {
         let Some(target) = lock(&self.st).by_uuid.get(&uuid).cloned() else { return vec![] };
         let at = [target.position[0].floor() as i32, target.position[1].floor() as i32, target.position[2].floor() as i32];
         if let Some(me) = host.player(s.uuid) {
-            host.player_set_compass_target(me, at);
+            me.set_compass_target(host, at);
         }
         vec!["&dCompass repointed.".to_owned()]
     }
