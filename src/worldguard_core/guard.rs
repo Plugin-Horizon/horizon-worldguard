@@ -784,6 +784,18 @@ impl Guard {
         self.state_plain(p, p.block(), "natural-health-regen", "").is_ok()
     }
 
+    /// `weather-lock` and `time-lock`: the string the regions at the player's feet give (`queryValue`).
+    pub fn lock_value(&self, p: &Player, flag: &str) -> Option<String> {
+        if !self.cfg.enable {
+            return None;
+        }
+        let w = self.world(&p.dimension)?;
+        match Query::new(w).value(p.block(), flag, &Actor::Player(&p.subject)) {
+            Some(FlagValue::Str(s)) => Some(s),
+            _ => None,
+        }
+    }
+
     /// Hunger draining from `p` (`natural-hunger-drain`).
     pub fn natural_hunger(&self, p: &Player) -> bool {
         self.state_plain(p, p.block(), "natural-hunger-drain", "").is_ok()

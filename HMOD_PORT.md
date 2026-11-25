@@ -85,3 +85,7 @@ Checklist round 100
 [ ] `weather-lock`, `time-lock` (per-player weather and time, API gap)
 [ ] `iconomy.*`, `summary-on-start`, `custom-metrics-charts`, `regions.use-paper-entity-origin`, `event-handling.*`: not applicable
 Open items are API-blocked or need a config text store; the checklist is not finished, so this is not 100 %.
+
+Round 5 (round 2 against the combined next SDK, 2026-11-25; written blind, not built)
+- Added: `weather-lock`, `time-lock` (`worldguard_core/session.rs`, `apply_lock` in `lib.rs`: `game_event` 1/2/7/8 and `set_time` through `player_send_packet`, resent every tick while a time lock holds); `vine-growth`, `sculk-growth` (`natural_block_spread`, `block_grow`); `potion-splash` splash (`potion_splash_cancel`); `mobs.block-zombie-door-destruction` (`entity_break_door_cancel`); `disable-death-messages` (`player_death_message`); blacklist `on-dispense` (`block_dispense`) and `ignore-groups` (`permission_groups`); `/halt-activity` entity removal (`sweep_intensive`, `levels().list_levels()`, `level.all_entities`, `entity.discard`); `/rg migrateuuid`; late region nodes without the feature gate; `hanging_break` reads the event's dimension.
+- Gaps left (all in audit `ENGINE_NEEDS.md`): block_physics_cancel, cancellable_mob_event_hooks (portal_create cancel, host in the damage hook), block_growth_spread_hooks (grass, mycelium, rock), blacklist_equip_dispense_hooks (equip only), living_heal_cause_cancel, compass_target, profiler.

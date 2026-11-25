@@ -21,7 +21,8 @@ use mod_api::{
     CropGrowPreEvent, EntityChangeBlockPreEvent, EntityMobGriefingEvent, ExplosionStartEvent,
     FluidPlaceBlockEvent, FoodLevelChangedEvent, Host, LivingExperienceDropEvent, LivingHealEvent, LoopContext,
     MoistureChangeEvent, BlockFadeEvent, BlockFormEvent, BlockGrowFeatureEvent, EntityStruckByLightningEvent, Hand,
-    SignChangedEvent, WeatherChangeEvent,
+    SignChangedEvent, WeatherChangeEvent, BlockDispenseEvent, BlockGrowEvent, EntityBreakDoorCancelEvent,
+    NaturalBlockSpreadEvent, PlayerDeathMessageEvent, PotionSplashCancelEvent,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -112,6 +113,8 @@ struct State {
     rescues: Vec<u128>,
     /// Sponges placed (dimension, position): the water around them is cleared at the next tick.
     sponge_clears: Vec<(String, [i32; 3])>,
+    /// Who is under a `weather-lock` or `time-lock`.
+    sessions: wg::session::Sessions,
 }
 
 impl Default for State {
@@ -139,6 +142,7 @@ impl Default for State {
             trail: HashMap::new(),
             rescues: Vec::new(),
             sponge_clears: Vec::new(),
+            sessions: wg::session::Sessions::default(),
         }
     }
 }
@@ -489,6 +493,101 @@ fn host_block(host: &dyn ServerHost, dimension: &str, pos: [i32; 3]) -> String {
         .unwrap_or_default()
 }
 
+/// The dimensions of the worlds that have a region file, for a hook that names none.
+fn region_dimensions(guard: &Guard) -> Vec<String> {
+    guard
+        .worlds
+        .keys()
+        .map(|w| guard.cfg.dimension_of(w).unwrap_or_else(|| format!("minecraft:{w}")))
+        .collect()
+}
+
+/// The dimension of a hook that names none: the acting player's, else None.
+fn acting_dimension(host: &dyn ServerHost) -> Option<String> {
+    host.players()
+        .acting_player()
+        .and_then(|p| p.level(host))
+        .map(|l| l.dimension_id().to_string())
+}
+
+/// `Entities.isIntensiveEntity`: items, primed TNT, experience orbs, falling blocks and every living thing that is not
+/// tamed, a player or an armor stand.
+fn is_intensive(host: &dyn ServerHost, entity: mod_api::EntityRef) -> bool {
+    let Some(kind) = entity.kind(host).map(|k| k.id(host).to_string()) else {
+        return false;
+    };
+    match kind.strip_prefix("minecraft:").unwrap_or(&kind) {
+        "item" | "tnt" | "experience_orb" | "falling_block" => true,
+        "player" | "armor_stand" => false,
+        _ => host
+            .living(entity)
+            .is_some_and(|l| l.is_tamed(host) != Some(true)),
+    }
+}
+
+/// Removes every intensive entity of every loaded level; the result is the count per level (by world name).
+fn sweep_intensive(host: &mut dyn ServerHost, cfg: &WgConfig) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+    for level in host.levels().list_levels() {
+        let world = cfg.world_of(&level.dimension_id().to_string());
+        let Some(entities) = level.all_entities(&*host) else { continue };
+        let mut removed = 0;
+        for e in entities {
+            if is_intensive(&*host, e) && e.discard(&mut *host) {
+                removed += 1;
+            }
+        }
+        out.push((world, removed));
+    }
+    out
+}
+
+/// Sends one play packet to `uuid` alone; false when it could not be built or sent.
+fn send_to(host: &mut dyn ServerHost, uuid: u128, packet: &str, body: Vec<u8>) -> bool {
+    use mod_api::{ClientboundPlayPacket, Identifier};
+    let Ok(id) = Identifier::parse(packet) else { return false };
+    let Some(player) = host.player(uuid) else { return false };
+    host.player_send_packet(player, ClientboundPlayPacket::new(id, body)).is_ok()
+}
+
+/// One step of a `weather-lock` or `time-lock` for a player (see `worldguard_core::session`).
+fn apply_lock(host: &mut dyn ServerHost, uuid: u128, dimension: &str, action: wg::session::Action) {
+    use wg::session::{self, Action};
+    let level = host.level(dimension);
+    match action {
+        Action::Weather(raining, thundering) => {
+            for body in session::weather_events(raining, thundering) {
+                send_to(host, uuid, "minecraft:game_event", body);
+            }
+        }
+        Action::ResetWeather => {
+            let (rain, thunder) = level.and_then(|l| l.weather(&*host)).unwrap_or((0.0, 0.0));
+            for body in session::weather_level_events(rain, thunder) {
+                send_to(host, uuid, "minecraft:game_event", body);
+            }
+        }
+        Action::Time(..) | Action::ResetTime => {
+            let Some(level) = level else { return };
+            let (Ok(registry), Ok(name)) = (
+                mod_api::Identifier::parse("minecraft:world_clock"),
+                mod_api::Identifier::parse("minecraft:overworld"),
+            ) else {
+                return;
+            };
+            let Some(clock) = host.registry_protocol_id(&registry, &name) else { return };
+            let now = level.clock_time(&*host).or_else(|| level.day_time(&*host)).unwrap_or(0);
+            let game = level.game_time(&*host).unwrap_or(0);
+            let body = match action {
+                // A fixed time stops the client's clock; a relative one runs on from the world's time.
+                Action::Time(t, true) => session::set_time_body(game, clock, now + t, 1.0),
+                Action::Time(t, false) => session::set_time_body(game, clock, t, 0.0),
+                _ => session::set_time_body(game, clock, now, 1.0),
+            };
+            send_to(host, uuid, "minecraft:set_time", body);
+        }
+    }
+}
+
 /// The typed node for one `worldguard.*` name (a Boolean, as the commands ask it).
 fn perm_node(name: &str) -> PermissionNode {
     PermissionNode::new(name, PermissionValueType::Boolean)
@@ -496,7 +595,6 @@ fn perm_node(name: &str) -> PermissionNode {
 
 /// Declares a region-scoped `worldguard.region.*` node after the server started, once per node (the host refuses a
 /// second declaration with `DuplicateNode`, which is ignored). Default: operator level, as the gather-time nodes.
-#[cfg(feature = "horizon_late_permission_nodes")]
 fn declare_region_node_once(host: &mut dyn ServerHost, node: &str) {
     static DECLARED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
     if !node.starts_with("worldguard.region.") {
@@ -512,27 +610,34 @@ impl Players for KnownPlayers<'_> {
     // The node's answer from the permission system (LuckPerms answers through the `player_permission_check` hook);
     // a node that no one declared is refused, and so is any error: a denial, never a grant.
     // `worldguard.region.<perm>.<id>` (and `.own.`/`.member.`, `addowner.unclaimed.<id>`) depend on the region id, so
-    // they cannot be declared at gather time. Without the late-declaration API they are refused here, which takes away
-    // the per-region grants of non-operators (HMOD-GAP(region-scoped-nodes)). With `horizon_late_permission_nodes` each
-    // such node is declared the first time it is asked. Operators still pass through `guard.is_admin` before these.
+    // they cannot be declared at gather time, so they are declared late.
+    // the per-region grants of non-operators. Each such node is declared the first time it is asked
+    // (`permission_declare_node`). Operators still pass through `guard.is_admin` before these.
     fn has_permission(&self, uuid: u128, node: &str) -> bool {
         let mut slot = self.host.borrow_mut();
         let host: &mut dyn ServerHost = &mut **slot;
-        #[cfg(feature = "horizon_late_permission_nodes")]
         declare_region_node_once(host, node);
         let Some(player) = host.player(uuid) else {
             return false;
         };
         player.permission_bool(host, &perm_node(node)).unwrap_or(false)
     }
+    // Names seen this session first, then the server's own profile lookup (user cache; never Mojang).
     fn resolve(&self, name: &str) -> Option<(u128, String)> {
-        self.names.get(&name.to_ascii_lowercase()).cloned()
+        self.names.get(&name.to_ascii_lowercase()).cloned().or_else(|| {
+            let slot = self.host.borrow();
+            slot.profile_by_name(name).map(|p| (p.uuid, p.name))
+        })
     }
     fn name_of(&self, uuid: u128) -> Option<String> {
         self.names
             .values()
             .find(|(u, _)| *u == uuid)
             .map(|(_, n)| n.clone())
+            .or_else(|| {
+                let slot = self.host.borrow();
+                slot.profile_by_uuid(uuid).map(|p| p.name)
+            })
     }
 }
 
@@ -633,18 +738,21 @@ impl Mod {
             return true;
         }
         let player = host.player(p.subject.uuid);
+        // `ignore-groups`: the groups the permission provider published for the player (none without a provider).
+        let player_groups = host.permission_groups(p.subject.uuid).groups;
         let event = wg::blacklist::Event {
             kind,
             player: Some(p.subject.name.clone()),
             target: target.to_owned(),
         };
         // `ignore-perms`: a node that nobody declared is refused, so only declared nodes can exempt.
-        let mut ignores = |_groups: &[String], perms: &[String]| {
-            player.is_some_and(|pl| {
-                perms
-                    .iter()
-                    .any(|n| pl.permission_bool(&mut *host, &perm_node(n.trim())).unwrap_or(false))
-            })
+        let mut ignores = |groups: &[String], perms: &[String]| {
+            groups.iter().any(|g| player_groups.iter().any(|pg| pg.eq_ignore_ascii_case(g.trim())))
+                || player.is_some_and(|pl| {
+                    perms
+                        .iter()
+                        .any(|n| pl.permission_bool(&mut *host, &perm_node(n.trim())).unwrap_or(false))
+                })
         };
         let verdict = bl.check(&event, false, silent, now_ms, &mut ignores);
         let log_console = guard.rule(&p.dimension, "blacklist.logging.console.enable");
@@ -683,6 +791,34 @@ impl Mod {
         }
         if let Some(reason) = &verdict.ban {
             commands.push(format!("ban {} {reason}", p.subject.name));
+        }
+        verdict.allowed
+    }
+
+    /// The blacklist's `on-dispense` for a dispenser (no player): whether `target` may be dispensed in `dimension`.
+    fn dispense_allowed(&self, dimension: &str, target: &str) -> bool {
+        let mut st = lock(&self.st);
+        let world = st.guard.cfg.world_of(dimension);
+        let now_ms = st.ticks * 1000 / TPS;
+        let State { blacklists, guard, by_uuid, tells, .. } = &mut *st;
+        let Some(bl) = blacklists.get_mut(&world) else {
+            return true;
+        };
+        if !bl.has_target(target) {
+            return true;
+        }
+        let event = wg::blacklist::Event { kind: EventType::Dispense, player: None, target: target.to_owned() };
+        let verdict = bl.check(&event, false, false, now_ms, &mut |_, _| false);
+        if guard.rule(dimension, "blacklist.logging.console.enable") {
+            for l in &verdict.log {
+                eprintln!("[worldguard] {l}");
+            }
+        }
+        for n in &verdict.notify {
+            eprintln!("[worldguard] {n}");
+            for s in by_uuid.values().filter(|s| s.permission >= guard.cfg.op_level) {
+                tells.push((s.uuid, format!("&7{n}")));
+            }
         }
         verdict.allowed
     }
@@ -1089,8 +1225,9 @@ impl Mod {
     }
 
     /// `/halt-activity [confirm]` (`/stoplag`, `/haltactivity`) with `-c` (lift), `-i` (status), `-s` (silent).
-    // HMOD-GAP(halt_entities): the entities that are already there are not removed (no way to list the
-    // loaded entities of a level); spawns, explosions, fire, leaf decay and fluid flow are stopped.
+    // The entities that are there are removed (`sweep_intensive`), and again every ten seconds while the halt
+    // lasts (WorldGuard does it on every chunk load and join); spawns, explosions, fire, leaf decay and fluid flow
+    // are stopped.
     fn halt_command(
         &self,
         host: &mut dyn ServerHost,
@@ -1148,6 +1285,12 @@ impl Mod {
                 out.push(format!("&d(Silent) ALL intensive server activity halted by {name}."));
             } else {
                 self.notify(host, &format!("&eALL intensive server activity halted by {name}."));
+            }
+            let cfg = lock(&self.st).guard.cfg.clone();
+            for (world, removed) in sweep_intensive(&mut *host, &cfg) {
+                if removed > 10 {
+                    out.push(format!("{removed} entities (>10) auto-removed from {world}"));
+                }
             }
         } else if silent {
             out.push("&d(Silent) ALL intensive server activity is now allowed.".to_owned());
@@ -1612,6 +1755,7 @@ impl Hooks for Mod {
         let mut pushes: Vec<(u128, String, [f64; 3], f32, f32)> = Vec::new();
         let mut ops_notes: Vec<String> = Vec::new();
         let mut vital_changes: Vec<(u128, Change)> = Vec::new();
+        let mut lock_actions: Vec<(u128, String, wg::session::Action)> = Vec::new();
         let now_ms = st.ticks * 1000 / TPS;
         for np in &players {
             let p = st.player(np);
@@ -1662,6 +1806,18 @@ impl Hooks for Mod {
                 }
             }
         }
+        // `weather-lock` and `time-lock`: what each player sees while a region locks it.
+        {
+            let ps: Vec<Player> = players.iter().map(|np| st.player(np)).collect();
+            let State { guard, sessions, .. } = &mut *st;
+            for (np, p) in players.iter().zip(&ps) {
+                let weather = guard.lock_value(p, "weather-lock");
+                let time = guard.lock_value(p, "time-lock");
+                for a in sessions.step(np.uuid, weather.as_deref(), time.as_deref()) {
+                    lock_actions.push((np.uuid, np.dimension.clone(), a));
+                }
+            }
+        }
         // One position a second per player, the last four: where `teleport-on-void-falling` and
         // `teleport-on-suffocation` put a player back.
         let online_set: HashSet<u128> = players.iter().map(|p| p.uuid).collect();
@@ -1697,9 +1853,21 @@ impl Hooks for Mod {
             st.save_at = None;
             st.save_dirty();
         }
+        let sweep = st.guard.activity_halted && st.ticks % (TPS * 10) == 0;
+        let sweep_cfg = if sweep { Some(st.guard.cfg.clone()) } else { None };
         drop(st);
+        if let Some(cfg) = sweep_cfg {
+            // `/halt-activity`: what loaded or spawned in since the last sweep (WorldGuard does it per chunk load).
+            let removed: usize = sweep_intensive(host, &cfg).iter().map(|(_, n)| n).sum();
+            if removed > 50 {
+                eprintln!("[worldguard] Halt-Act: {removed} entities (>50) auto-removed");
+            }
+        }
         for (u, dim, to, yaw, pitch) in pushes {
             teleport(host, u, &dim, to, yaw, pitch);
+        }
+        for (u, dim, action) in lock_actions {
+            apply_lock(host, u, &dim, action);
         }
         for (u, change) in vital_changes {
             let Some(player) = host.player(u) else { continue };
@@ -1778,6 +1946,7 @@ impl Hooks for Mod {
         st.god.remove(&event.player);
         st.vitals.forget(event.player);
         st.bypass.remove(&event.player);
+        st.sessions.forget(event.player);
     }
 
     // -- blocks ----------------------------------------------------------------------------
@@ -1954,11 +2123,10 @@ impl Hooks for Mod {
                 g.hanging_break(Some(p), &p.dimension.clone(), bp(pos), kind)
             }),
             None => {
-                // No dimension in the event: the overworld's regions decide.
                 let st = lock(&self.st);
                 if st
                     .guard
-                    .hanging_break(None, OVERWORLD, bp(pos), kind)
+                    .hanging_break(None, event.dimension, bp(pos), kind)
                     .is_ok()
                 {
                     Flow::Continue
@@ -2186,6 +2354,78 @@ impl Hooks for Mod {
         } else {
             Flow::Cancel
         }
+    }
+
+    /// `vine-growth` and `sculk-growth` (and `dynamics.disable-vine-growth`, `disable-sculk-growth`): a vine or sculk
+    /// spreading into `to`. Grass, mycelium and rock growth have no hook yet.
+    fn natural_block_spread(&self, _level: &dyn LevelHost, event: &mut NaturalBlockSpreadEvent<'_>) -> Flow {
+        let block = match event.kind {
+            "vine" => "minecraft:vine",
+            "sculk" => "minecraft:sculk",
+            _ => return Flow::Continue,
+        };
+        let at = bp_of([event.to.x, event.to.y, event.to.z]);
+        if lock(&self.st).guard.block_grow(&dim_id(&event.dimension), at, block) {
+            Flow::Continue
+        } else {
+            Flow::Cancel
+        }
+    }
+
+    /// `sculk-growth`: a sculk block growing in place (a shrieker or sensor above a charged block).
+    fn block_grow(&self, level: &dyn LevelHost, event: &mut BlockGrowEvent) -> Flow {
+        let block = state_name(level, event.to);
+        let at = bp_of([event.pos.x, event.pos.y, event.pos.z]);
+        if lock(&self.st).guard.block_grow(&dim_id(&event.dimension), at, &block) {
+            Flow::Continue
+        } else {
+            Flow::Cancel
+        }
+    }
+
+    /// `potion-splash`: a thrown potion about to apply its effects. WorldGuard asks the flag at each affected
+    /// entity; the hook names the landing spot only, so the flag is read there. The hook names no dimension: the
+    /// thrower's decides, else the potion is kept only when a world without the flag could hold it.
+    fn potion_splash_cancel(&self, host: &mut dyn ServerHost, event: &mut PotionSplashCancelEvent<'_>) -> Flow {
+        let at = BlockPos::of(event.pos);
+        let dimension = acting_dimension(&*host);
+        let st = lock(&self.st);
+        let allowed = match dimension {
+            Some(d) => st.guard.cloud_spawns(&d, at),
+            None => {
+                let dims = region_dimensions(&st.guard);
+                dims.is_empty() || dims.iter().any(|d| st.guard.cloud_spawns(d, at))
+            }
+        };
+        if allowed { Flow::Continue } else { Flow::Cancel }
+    }
+
+    /// `mobs.block-zombie-door-destruction`.
+    fn entity_break_door_cancel(&self, host: &mut dyn ServerHost, event: &mut EntityBreakDoorCancelEvent<'_>) -> Flow {
+        let dimension = host
+            .entity(event.entity)
+            .and_then(|e| e.level(&*host))
+            .map(|l| l.dimension_id().to_string())
+            .unwrap_or_else(|| OVERWORLD.to_owned());
+        if lock(&self.st).guard.door_break_blocked(&dimension) { Flow::Cancel } else { Flow::Continue }
+    }
+
+    /// `player-damage.disable-death-messages`: nothing is said when a player dies.
+    fn player_death_message(&self, host: &mut dyn ServerHost, event: &mut PlayerDeathMessageEvent<'_>) {
+        let dimension = host
+            .player(event.player)
+            .and_then(|p| p.level(&*host))
+            .map(|l| l.dimension_id().to_string())
+            .unwrap_or_else(|| OVERWORLD.to_owned());
+        if lock(&self.st).guard.rule(&dimension, "player-damage.disable-death-messages") {
+            *event.message = None;
+        }
+    }
+
+    /// The blacklist's `on-dispense`.
+    fn block_dispense(&self, host: &mut dyn ServerHost, event: &mut BlockDispenseEvent<'_>) -> Flow {
+        let item = event.stack.item().id(&*host).to_string();
+        if self.dispense_allowed(event.dimension, &item) { Flow::Continue } else { Flow::Cancel }
     }
 
     /// `weather.disable-weather`, `disable-thunderstorm`, `always-raining`, `always-thundering`.
