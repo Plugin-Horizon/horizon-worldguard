@@ -8,3 +8,7 @@ publish = false
 # The pinned SDK's API crate, fetched into .horizon/sdk/ by any `cargo horizon-mod` command.
 horizon-mod-api = { path = ".horizon/sdk/api/crates/horizon-mod-api" }
 toml = "=1.1.6"
+
+[features]
+# Hooks and host calls of the local branches rec-cancel-hooks and rec-player-misc (not in the SDK yet).
+next-engine = []
