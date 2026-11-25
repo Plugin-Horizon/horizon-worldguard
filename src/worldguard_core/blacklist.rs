@@ -333,8 +333,8 @@ impl Blacklist {
 }
 
 /// The file log of the blacklist (`blacklist.logging.file.enable`): WorldGuard's default path pattern. The
-/// `path` and `open-files` options are not read yet (text options are not kept by the config), so this is the
-/// pattern every world uses.
+/// default `path`; a world's own `path` option overrides it (config.rs `text_in`). `open-files` (the Java handler's
+/// cache of open file handles) is not needed: each line opens and appends the file, the result is equal.
 pub const LOG_FILE_PATTERN: &str = "worldguard/logs/%Y-%m-%d.log";
 
 /// The parts of a Unix time WorldGuard's `%` codes read, in UTC (Java uses the server's local time zone).

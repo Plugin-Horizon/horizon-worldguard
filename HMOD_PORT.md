@@ -77,7 +77,7 @@ Checklist round 100
 [ ] `/wg running` lists tasks: the port runs no async tasks, so it always says none
 [ ] `/rg migratedb` only the file store; `migrateuuid` is a stub (no SQL, no UUID migration)
 [ ] blacklist `on-equip`, `on-dispense`, `ignore-groups`, database log (API gaps, GAPS_UPSTREAM)
-[ ] blacklist `path` and `open-files` text options (config keeps no text values)
+[n/a java-only] blacklist `open-files` (cache of open file handles; port appends per line, same file content); `path` is done
 [ ] per-world `config.yml` text values (`path`, `dsn`-type options), only booleans, numbers and lists are kept
 [ ] `physics.*`, `mobs.block-zombie-door-destruction`, `enderman` portal, `anti-wolf-dumbness`, growth flags (API gaps)
 [ ] death messages, pumpkin scuba, conduit effects, item durability, infinite stacks, potion blocking (API gaps)
