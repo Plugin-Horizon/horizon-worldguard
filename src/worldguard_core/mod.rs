@@ -24,3 +24,4 @@ pub mod blacklist;
 pub mod chest;
 pub mod session;
 pub mod debug;
+pub mod paste;

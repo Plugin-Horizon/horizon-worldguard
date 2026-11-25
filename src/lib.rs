@@ -129,7 +129,7 @@ struct State {
     infinite_override: HashSet<u128>,
     /// The session of `/wg profile` (the handle and who started it), when one runs.
     #[cfg(feature = "wave2")]
-    profile: Option<(ProfileHandle, String)>,
+    profile: Option<(ProfileHandle, String, bool)>,
     /// `heal-*` / `feed-*` timers.
     vitals: Vitals,
     /// Players who hold `worldguard.region.bypass.<world>` for the world they are in (read once a second).
@@ -400,6 +400,21 @@ impl State {
             self.commands.push(wg::debug::smoke_command(&p.dimension, &p.subject.name, at));
         }
     }
+}
+
+/// Finished pastes: who asked (None for the console) and the line to tell them.
+static PASTED: Mutex<Vec<(Option<u128>, String)>> = Mutex::new(Vec::new());
+
+/// Uploads `content` to the paste service on a thread and queues the answer for the next tick.
+fn spawn_paste(who: Option<u128>, content: String, extension: &'static str, label: &'static str) {
+    std::thread::spawn(move || {
+        let meta = wg::paste::Meta { name: None, author: None, extension: Some(extension) };
+        let line = match wg::paste::upload(wg::paste::SERVICE, &content, &meta) {
+            Ok(url) => format!("&d{label}{url}"),
+            Err(e) => format!("&cFailed to submit paste: {e}"),
+        };
+        PASTED.lock().unwrap_or_else(|e| e.into_inner()).push((who, line));
+    });
 }
 
 /// One player through the host, or None when they are not in a level.
@@ -965,8 +980,12 @@ impl Mod {
                 "&7* Horizon".to_owned(),
             ],
             "report" => {
-                if arg.split_whitespace().any(|a| a == "-p") {
-                    return vec!["&cThe report cannot be uploaded: there is no paste service.".into()];
+                let paste = arg.split_whitespace().any(|a| a == "-p");
+                if paste
+                    && let Some(s) = sender
+                    && !may(&mut *host, s.uuid, "worldguard.report.pastebin", st.guard.cfg.op_level)
+                {
+                    return vec![NO_PERMISSION.to_owned()];
                 }
                 let Some(dir) = st.data_dir.clone() else {
                     return vec!["&cFailed to write report: no world is open.".into()];
@@ -982,7 +1001,15 @@ impl Mod {
                     }
                 }
                 let file = dir.join("report.txt");
+                let pasted = report.clone();
                 match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&file, report)) {
+                    Ok(()) if paste => {
+                        spawn_paste(sender.map(|s| s.uuid), pasted, "report", "WorldGuard report: ");
+                        vec![format!(
+                            "&dWorldGuard report written to {}/report.txt",
+                            st.guard.cfg.data_folder.trim_end_matches('/')
+                        )]
+                    }
                     Ok(()) => vec![format!(
                         "&dWorldGuard report written to {}/report.txt",
                         st.guard.cfg.data_folder.trim_end_matches('/')
@@ -1112,11 +1139,11 @@ impl Mod {
                 }
                 None => true,
             };
-            out.push(if allowed {
-                "&cThe report cannot be uploaded: there is no paste service.".to_owned()
+            if allowed {
+                spawn_paste(sender.map(|s| s.uuid), report.join("\n"), "txt", "Event debugging report: ");
             } else {
-                NO_PERMISSION.to_owned()
-            });
+                out.push(NO_PERMISSION.to_owned());
+            }
         } else {
             let long = report.iter().map(String::len).sum::<usize>() >= 500;
             out.extend(report.iter().map(|l| format!("&b{l}")));
@@ -1175,14 +1202,11 @@ impl Mod {
         let level = if chunks { ProfileLevel::Chunks } else { ProfileLevel::Basic };
         match host.profiler_start(ProfileScope::new(level, ticks, filter)) {
             Ok(handle) => {
-                lock(&self.st).profile = Some((handle, sender.map(|s| s.name.clone()).unwrap_or_default()));
+                lock(&self.st).profile = Some((handle, sender.map(|s| s.name.clone()).unwrap_or_default(), pastebin));
                 let mut out = vec![
                     format!("&dStarting profiling. Results will be available in {} minutes.", ticks / 1200),
                     "&7Use &b/wg stopprofile&7 at any time to cancel profiling.".to_owned(),
                 ];
-                if pastebin {
-                    out.push("&cThe result cannot be uploaded: there is no paste service.".to_owned());
-                }
                 out
             }
             Err(ProfileRefusal::Running) => vec![
@@ -1197,7 +1221,7 @@ impl Mod {
 
     #[cfg(feature = "wave2")]
     fn stop_profile_command(&self, host: &mut dyn ServerHost) -> Vec<String> {
-        let Some((handle, _)) = lock(&self.st).profile.take() else {
+        let Some((handle, _, _)) = lock(&self.st).profile.take() else {
             return vec!["&cNo profile is currently running.".to_owned()];
         };
         let _ = host.profiler_stop(handle);
@@ -1208,7 +1232,7 @@ impl Mod {
     #[cfg(feature = "wave2")]
     fn finish_profile(&self, host: &mut dyn ServerHost) {
         use wg::debug::Row;
-        let Some((handle, who)) = lock(&self.st).profile.clone() else { return };
+        let Some((handle, who, pastebin)) = lock(&self.st).profile.clone() else { return };
         let Some(report) = host.profiler_report(handle) else {
             lock(&self.st).profile = None;
             return;
@@ -1245,6 +1269,10 @@ impl Mod {
             ),
         ];
         let text = wg::debug::profile_text(report.ticks, report.mod_calls_dropped, &sections);
+        if pastebin {
+            let uuid = lock(&self.st).names.get(&who.to_ascii_lowercase()).map(|n| n.0);
+            spawn_paste(uuid, text.clone(), "profile", "Profile result: ");
+        }
         let mut st = lock(&self.st);
         st.profile = None;
         let msg = match st.data_dir.clone() {
@@ -2180,6 +2208,12 @@ impl Hooks for Mod {
         let teleported = std::mem::take(&mut st.teleported);
         let online_count = players.len();
         let mut tells: Vec<(u128, String)> = std::mem::take(&mut st.tells);
+        for (who, line) in std::mem::take(&mut *PASTED.lock().unwrap_or_else(|e| e.into_inner())) {
+            match who {
+                Some(u) => tells.push((u, line)),
+                None => eprintln!("[worldguard] {}", text::plain(&line)),
+            }
+        }
         let mut titles: Vec<(u128, String, String)> = Vec::new();
         let mut pushes: Vec<(u128, String, [f64; 3], f32, f32)> = Vec::new();
         let mut ops_notes: Vec<String> = Vec::new();
