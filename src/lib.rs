@@ -2201,7 +2201,7 @@ impl Hooks for Mod {
         }
         let text = std::str::from_utf8(&event.payload.0).ok()?;
         let (world, id) = text.split_once('\t')?;
-        let st = lock(&self.state);
+        let st = lock(&self.st);
         let reply = region_reply(st.guard.worlds.get(world).and_then(|w| w.get(id.trim())));
         Some(mod_api::PayloadBytes(reply.into_bytes()))
     }
@@ -2504,6 +2504,7 @@ impl Hooks for Mod {
         let mut st = lock(&self.st);
         st.tracker.forget(event.player);
         st.god.remove(&event.player);
+        let st = &mut *st;
         for set in [
             &mut st.pending_auto,
             &mut st.god_override,
