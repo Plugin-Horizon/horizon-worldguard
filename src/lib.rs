@@ -24,9 +24,9 @@ use mod_api::{
     SignChangedEvent, WeatherChangeEvent, BlockDispenseEvent, BlockGrowEvent, EntityBreakDoorCancelEvent,
     NaturalBlockSpreadEvent, PlayerDeathMessageEvent, PotionSplashCancelEvent,
 };
-#[cfg(feature = "next-engine")]
 use mod_api::{
     ArmorEquipCancelEvent, BlockGrowthCancelEvent, BlockPhysicsCancelEvent, LivingHealCauseCancelEvent,
+    PortalCreateEntityCancelEvent,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -546,19 +546,9 @@ fn sweep_intensive(host: &mut dyn ServerHost, cfg: &WgConfig) -> Vec<(String, us
     out
 }
 
-/// Sends one play packet to `uuid` alone; false when it could not be built or sent.
-fn send_to(host: &mut dyn ServerHost, uuid: u128, packet: &str, body: Vec<u8>) -> bool {
-    use mod_api::{ClientboundPlayPacket, Identifier};
-    let Ok(id) = Identifier::parse(packet) else { return false };
-    let Some(player) = host.player(uuid) else { return false };
-    host.player_send_packet(player, ClientboundPlayPacket::new(id, body)).is_ok()
-}
-
 /// One step of a `weather-lock` or `time-lock` for a player (see `worldguard_core::session`).
 fn apply_lock(host: &mut dyn ServerHost, uuid: u128, dimension: &str, action: wg::session::Action) {
-    use wg::session::{self, Action};
-    // With the per-player weather and time of rec-player-misc the host does it; the packets are the fallback.
-    #[cfg(feature = "next-engine")]
+    use wg::session::Action;
     {
         let Some(player) = host.player(uuid) else { return };
         match action {
@@ -576,41 +566,6 @@ fn apply_lock(host: &mut dyn ServerHost, uuid: u128, dimension: &str, action: wg
             }
         }
         let _ = dimension;
-        return;
-    }
-    #[allow(unreachable_code)]
-    let level = host.level(dimension);
-    match action {
-        Action::Weather(raining, thundering) => {
-            for body in session::weather_events(raining, thundering) {
-                send_to(host, uuid, "minecraft:game_event", body);
-            }
-        }
-        Action::ResetWeather => {
-            let (rain, thunder) = level.and_then(|l| l.weather(&*host)).unwrap_or((0.0, 0.0));
-            for body in session::weather_level_events(rain, thunder) {
-                send_to(host, uuid, "minecraft:game_event", body);
-            }
-        }
-        Action::Time(..) | Action::ResetTime => {
-            let Some(level) = level else { return };
-            let (Ok(registry), Ok(name)) = (
-                mod_api::Identifier::parse("minecraft:world_clock"),
-                mod_api::Identifier::parse("minecraft:overworld"),
-            ) else {
-                return;
-            };
-            let Some(clock) = host.registry_protocol_id(&registry, &name) else { return };
-            let now = level.clock_time(&*host).or_else(|| level.day_time(&*host)).unwrap_or(0);
-            let game = level.game_time(&*host).unwrap_or(0);
-            let body = match action {
-                // A fixed time stops the client's clock; a relative one runs on from the world's time.
-                Action::Time(t, true) => session::set_time_body(game, clock, now + t, 1.0),
-                Action::Time(t, false) => session::set_time_body(game, clock, t, 0.0),
-                _ => session::set_time_body(game, clock, now, 1.0),
-            };
-            send_to(host, uuid, "minecraft:set_time", body);
-        }
     }
 }
 
@@ -1332,7 +1287,6 @@ impl Mod {
 
     /// `/locate <player>`: points the sender's compass at the player (`GeneralCommands.locate`). Needs the compass call
     /// of rec-player-misc; without it the command says so. `/locate` alone (the world spawn) needs a spawn read.
-    #[cfg(feature = "next-engine")]
     fn locate_command(&self, host: &mut dyn ServerHost, sender: Option<&Snap>, args: &str) -> Vec<String> {
         let Some(s) = sender else { return vec!["&cA player is expected.".to_owned()] };
         let op_level = lock(&self.st).guard.cfg.op_level;
@@ -1344,8 +1298,15 @@ impl Mod {
             return vec!["&cToo many parameters.".to_owned(), "&cUsage: /locate [player]".to_owned()];
         }
         let Some(name) = words.first() else {
-            // HMOD-GAP(level_spawn_position): the world spawn cannot be read.
-            return vec!["&cThe world spawn cannot be read on this server.".to_owned()];
+            // No argument: the compass points at the spawn of the sender's world.
+            let spawn = host.player(s.uuid).and_then(|me| me.level(&*host)).and_then(|l| l.respawn_data(&*host));
+            let Some(spawn) = spawn else {
+                return vec!["&cThe world spawn cannot be read on this server.".to_owned()];
+            };
+            if let Some(me) = host.player(s.uuid) {
+                me.set_compass_target(host, spawn.pos);
+            }
+            return vec!["&dCompass repointed to the world spawn.".to_owned()];
         };
         let (uuid, _) = match self.match_targets(name) {
             Ok(mut t) if t.len() == 1 => t.remove(0),
@@ -1358,12 +1319,6 @@ impl Mod {
             me.set_compass_target(host, at);
         }
         vec!["&dCompass repointed.".to_owned()]
-    }
-
-    #[cfg(not(feature = "next-engine"))]
-    fn locate_command(&self, _host: &mut dyn ServerHost, _sender: Option<&Snap>, _args: &str) -> Vec<String> {
-        // HMOD-GAP(compass_target): no compass call in the pinned SDK.
-        vec!["&cThis server cannot repoint a compass.".to_owned()]
     }
 
     /// `/stack`: merges the player's stacks of the same item (main inventory and hotbar).
@@ -2487,27 +2442,34 @@ impl Hooks for Mod {
     }
 
     /// `physics.no-physics-sand|gravel`: a gravity block that would start to fall stays.
-    #[cfg(feature = "next-engine")]
     fn block_physics_cancel(&self, level: &dyn LevelHost, event: &mut BlockPhysicsCancelEvent<'_>) -> Flow {
-        if event.source != "falling" {
-            return Flow::Continue;
-        }
         let block = state_name(level, event.block);
         let id = block.strip_prefix("minecraft:").unwrap_or(&block);
-        let option = match id {
-            "gravel" => "physics.no-physics-gravel",
-            "sand" | "red_sand" => "physics.no-physics-sand",
+        let dimension = dim_id(&event.dimension);
+        let option = match (event.source, id) {
+            ("falling", "gravel") => "physics.no-physics-gravel",
+            ("falling", "sand" | "red_sand") => "physics.no-physics-sand",
+            // A portal block that lost its frame stays (`allow-portal-anywhere`).
+            ("neighbor", "nether_portal") => "physics.allow-portal-anywhere",
+            // A ladder with a ladder above it holds on to nothing (`vine-like-rope-ladders`).
+            ("neighbor", "ladder") => {
+                let pos: [i32; 3] = event.pos.into();
+                if level_block(level, [pos[0], pos[1] + 1, pos[2]]) != "minecraft:ladder" {
+                    return Flow::Continue;
+                }
+                "physics.vine-like-rope-ladders"
+            }
             _ => return Flow::Continue,
         };
-        if lock(&self.st).guard.rule(&dim_id(&event.dimension), option) { Flow::Cancel } else { Flow::Continue }
+        if lock(&self.st).guard.rule(&dimension, option) { Flow::Cancel } else { Flow::Continue }
     }
 
     /// `grass-growth`, `mycelium-spread` (and `dynamics.disable-grass-growth|mycelium-spread`).
-    #[cfg(feature = "next-engine")]
     fn block_growth_cancel(&self, _level: &dyn LevelHost, event: &mut BlockGrowthCancelEvent<'_>) -> Flow {
         let block = match event.kind {
             "grass" => "minecraft:grass_block",
             "mycelium" => "minecraft:mycelium",
+            "dripstone" => "minecraft:pointed_dripstone",
             _ => return Flow::Continue,
         };
         let at = bp_of([event.to.x, event.to.y, event.to.z]);
@@ -2515,7 +2477,6 @@ impl Hooks for Mod {
     }
 
     /// `natural-health-regen`: regeneration and satiated heals of a player in a region that denies it.
-    #[cfg(feature = "next-engine")]
     fn living_heal_cause_cancel(&self, _context: &dyn LoopContext, event: &mut LivingHealCauseCancelEvent<'_>) -> Flow {
         if !matches!(event.cause, "regeneration" | "satiated") {
             return Flow::Continue;
@@ -2527,8 +2488,16 @@ impl Hooks for Mod {
         if st.guard.natural_regen(&p) { Flow::Continue } else { Flow::Cancel }
     }
 
+    /// `mobs.block-enderdragon-portal-creation`: the exit portal of a killed ender dragon is not placed.
+    fn portal_create_entity_cancel(&self, _host: &mut dyn ServerHost, event: &mut PortalCreateEntityCancelEvent<'_>) -> Flow {
+        if lock(&self.st).guard.rule(&dim_id(&event.dimension), "mobs.block-enderdragon-portal-creation") {
+            Flow::Cancel
+        } else {
+            Flow::Continue
+        }
+    }
+
     /// The blacklist's `on-equip`.
-    #[cfg(feature = "next-engine")]
     fn armor_equip_cancel(&self, host: &mut dyn ServerHost, event: &mut ArmorEquipCancelEvent<'_>) -> Flow {
         let Some(p) = lock(&self.st).cached(event.player) else {
             return Flow::Continue;
@@ -2753,8 +2722,8 @@ impl Hooks for Mod {
     /// heals at most one point at a time, so only heals of one point or less are held back
     /// (HMOD-GAP(heal_cause): a Regeneration effect is held back too).
     fn living_heal(&self, _context: &dyn LoopContext, event: &mut LivingHealEvent) -> Flow {
-        if cfg!(feature = "next-engine") || event.amount > 1.0 {
-            // With `next-engine` the cause decides (`living_heal_cause_cancel`).
+        if true || event.amount > 1.0 {
+            // The cause decides (`living_heal_cause_cancel`).
             return Flow::Continue;
         }
         let st = lock(&self.st);
