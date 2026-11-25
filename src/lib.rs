@@ -6,7 +6,7 @@
 pub mod worldguard_core;
 mod chest_world;
 use mod_api::{
-    TriState, ArmorStandManipulateEvent, AttackEntityEvent, BlockBurnEvent, BlockIgniteEvent,
+    ModServiceCallEvent, TriState, ArmorStandManipulateEvent, AttackEntityEvent, BlockBurnEvent, BlockIgniteEvent,
     BlockSpreadEvent, BreakBlockEvent, BucketEmptyEvent, CanPlayerSleepEvent, Command,
     CommandArgumentValue, CommandSource, Config, ConfigKind, ConfigLoadingEvent,
     ConfigReloadingEvent, EnderPearlTeleportEvent, EntityInteractEvent, EntityJoinLevelEvent,
@@ -556,6 +556,20 @@ fn host_block(host: &dyn ServerHost, dimension: &str, pos: [i32; 3]) -> String {
         .and_then(|l| l.block(host, pos))
         .map(|k| k.id(host).to_string())
         .unwrap_or_default()
+}
+
+/// The `worldguard:region` answer for a region (see `mod_service_call`).
+fn region_reply(region: Option<&wg::region::Region>) -> String {
+    use wg::geom::Shape;
+    match region.map(|r| &r.shape) {
+        None => "none".to_owned(),
+        Some(Shape::Cuboid { min, max }) => format!("cuboid\t{}\t{}\t{}\t{}\t{}\t{}", min.x, min.y, min.z, max.x, max.y, max.z),
+        Some(Shape::Polygon { points, min_y, max_y }) => {
+            let pts: Vec<String> = points.iter().map(|p| format!("{},{}", p[0], p[1])).collect();
+            format!("polygon\t{min_y}\t{max_y}\t{}", pts.join(";"))
+        }
+        Some(Shape::Global) => "global".to_owned(),
+    }
 }
 
 /// The dimensions of the worlds that have a region file, for a hook that names none.
@@ -2179,6 +2193,19 @@ impl Hooks for Mod {
         Flow::Cancel
     }
 
+    /// The service `worldguard:region` other mods call: payload `<world>\t<region id>`; the reply is `none`, or
+    /// `cuboid\t<minx>\t<miny>\t<minz>\t<maxx>\t<maxy>\t<maxz>`, `polygon\t<miny>\t<maxy>\t<x,z;x,z;...>` or `global`.
+    fn mod_service_call(&self, _: &mut dyn ServerHost, event: &mut ModServiceCallEvent<'_>) -> Option<mod_api::PayloadBytes> {
+        if event.service != "worldguard:region" {
+            return None;
+        }
+        let text = std::str::from_utf8(&event.payload.0).ok()?;
+        let (world, id) = text.split_once('\t')?;
+        let st = lock(&self.state);
+        let reply = region_reply(st.guard.worlds.get(world).and_then(|w| w.get(id.trim())));
+        Some(mod_api::PayloadBytes(reply.into_bytes()))
+    }
+
     fn server_tick(&self, host: &mut dyn ServerHost, event: &mut ServerTickEvent<'_>) {
         if !matches!(
             event.phase,
@@ -3790,5 +3817,17 @@ impl Hooks for Mod {
                 Flow::Cancel
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod service_tests {
+    use super::*;
+
+    #[test]
+    fn the_region_service_describes_shapes() {
+        let c = wg::region::Region::new("spawn", wg::geom::Shape::cuboid(BlockPos::new(5, 0, 1), BlockPos::new(0, 9, 3)));
+        assert_eq!(region_reply(Some(&c)), "cuboid\t0\t0\t1\t5\t9\t3");
+        assert_eq!(region_reply(None), "none");
     }
 }
