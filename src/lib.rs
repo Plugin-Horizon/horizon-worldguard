@@ -2453,7 +2453,7 @@ impl Hooks for Mod {
             ("neighbor", "nether_portal") => "physics.allow-portal-anywhere",
             // A ladder with a ladder above it holds on to nothing (`vine-like-rope-ladders`).
             ("neighbor", "ladder") => {
-                let pos: [i32; 3] = event.pos.into();
+                let pos: [i32; 3] = [event.pos.x, event.pos.y, event.pos.z];
                 if level_block(level, [pos[0], pos[1] + 1, pos[2]]) != "minecraft:ladder" {
                     return Flow::Continue;
                 }
