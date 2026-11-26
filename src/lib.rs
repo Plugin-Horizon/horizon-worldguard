@@ -1792,6 +1792,22 @@ fn aliases_of(root: &str) -> &'static [&'static str] {
     }
 }
 
+/// One asking `<args:text>` argument per root, as Bukkit shows a command to the client: the aliases hang on the primary
+/// root only (a root of its own would make the alias "taken"), the rest of the line reaches `command_lines`.
+fn root_commands() -> Vec<Command> {
+    const PRIMARY: &[&str] = &["rg", "wg", "god", "ungod", "heal", "slay", "stopfire", "allowfire", "halt-activity", "stack", "locate"];
+    PRIMARY
+        .iter()
+        .map(|root| {
+            let mut command = Command::new(&cmdkit::ask(&format!("{root} [args:text]"), MOD_ID));
+            for alias in aliases_of(root) {
+                command = command.alias(alias);
+            }
+            command
+        })
+        .collect()
+}
+
 /// Every usage of WorldGuard's commands, root first: `/rg` (`commands::usages`), `/wg` and the general commands
 /// (`GeneralCommands`, `FlagCommands`, `WorldGuardCommands` of the original).
 fn tree_usages() -> &'static Vec<String> {
@@ -1878,6 +1894,36 @@ mod tree_tests {
     }
 
     #[test]
+    fn every_root_is_one_asking_argument_and_aliases_hang_on_the_primary_root() {
+        let commands = root_commands();
+        let usages: Vec<&str> = commands.iter().map(|c| c.usage.as_str()).collect();
+        assert!(usages.contains(&"rg [args:worldguard:text]"), "{usages:?}");
+        let rg = commands.iter().find(|c| c.usage.starts_with("rg ")).unwrap();
+        assert_eq!(rg.aliases, ["region", "regions"]);
+        // Every name the commands answer to is a root of the run hook, and no alias is also a root of its own.
+        let mut names: Vec<String> = Vec::new();
+        for c in &commands {
+            names.push(c.usage.split_whitespace().next().unwrap().to_owned());
+            names.extend(c.aliases.iter().cloned());
+        }
+        names.sort();
+        let mut want: Vec<String> = OUR_ROOTS.iter().map(|r| (*r).to_owned()).collect();
+        want.sort();
+        assert_eq!(names, want);
+    }
+
+    #[test]
+    fn paper_offers_only_the_online_names_at_every_word() {
+        let online = ["Notch".to_owned(), "alex".to_owned(), "Bob".to_owned()];
+        // Paper on `/rg `, `/god -s `, `/rg define ` and `/wg `: the names, nothing else.
+        for line in ["rg ", "god -s ", "rg define ", "wg ", "corewg-not-ours "] {
+            assert_eq!(paper_words(&online, line), ["alex", "Bob", "Notch"], "{line}");
+        }
+        assert_eq!(paper_words(&online, "rg addowner spawn no"), ["Notch"]);
+        assert!(paper_words(&online, "rg flag spawn pvp x").is_empty());
+    }
+
+    #[test]
     fn every_usage_names_only_registered_kinds() {
         for u in tree_usages() {
             let asked = cmdkit::ask(u, MOD_ID);
@@ -1906,38 +1952,17 @@ const OUR_ROOTS: &[&str] = &[
 
 // --- completions ----------------------------------------------------------------------------------
 //
-// `/rg` and `/wg` are one `<args:text>` argument for the engine, so the words come from the `tab_complete` hook: the
-// sub-commands, the options, the flag names, the region ids of the player's world (or of `-w <world>`), the worlds,
-// the online players and the values of state flags (`allow`, `deny`).
+// The original has no completer of its own (`WorldGuardPlugin` registers no `TabCompleter`), so a player is offered what
+// Bukkit offers for any command without one: the names of the players online that begin with the word being typed, at
+// every position and for every WorldGuard command. No sub-commands, flags, worlds or region ids are suggested, so the
+// client is given one asking argument per root (`register_commands`) and no literal tree to complete from.
 
-/// `commands::usages()` split into words, built once. The first word is the sub-command.
-fn rg_usage_words() -> &'static Vec<Vec<String>> {
-    static WORDS: OnceLock<Vec<Vec<String>>> = OnceLock::new();
-    WORDS.get_or_init(|| commands::usages().iter().map(|u| u.split_whitespace().map(str::to_owned).collect()).collect())
-}
-
-/// A usage word `<name:kind>` or `[name:kind]`: its name and kind.
-fn usage_arg(word: &str) -> Option<(&str, &str)> {
-    word.strip_prefix('<')
-        .and_then(|w| w.strip_suffix('>'))
-        .or_else(|| word.strip_prefix('[').and_then(|w| w.strip_suffix(']')))?
-        .split_once(':')
-}
-
-fn starts_with_any_case(word: &str, prefix: &str) -> bool {
-    word.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase())
-}
-
-/// Whether the player may use `/rg <sub>` at all: an operator, a `player-commands` entry, or a provider's grant of
-/// `worldguard.region.<sub>` (also its `.own` / `.member` forms, which apply to regions the player stands in).
-fn may_rg_sub(host: &mut dyn ServerHost, uuid: u128, op_level: u8, player_commands: &[String], sub: &str) -> bool {
-    let Some(p) = host.player(uuid) else { return false };
-    if p.permission_level(&*host).unwrap_or(0) >= op_level || player_commands.iter().any(|c| c == sub) {
-        return true;
-    }
-    ["", ".own", ".member"].iter().any(|tail| {
-        p.permission_bool(&mut *host, &perm_node(&format!("worldguard.region.{sub}{tail}"))).unwrap_or(false)
-    })
+/// The names (of `online`) that complete the last word of `command`, the line after the slash.
+fn paper_words(online: &[String], command: &str) -> Vec<String> {
+    let prefix = command.rsplit(' ').next().unwrap_or("").to_ascii_lowercase();
+    let mut names: Vec<String> = online.iter().filter(|n| n.to_ascii_lowercase().starts_with(&prefix)).cloned().collect();
+    names.sort_by_key(|n| n.to_ascii_lowercase());
+    names
 }
 
 impl Mod {
@@ -2004,132 +2029,6 @@ impl Mod {
             st.amphibious.insert(uuid);
             eprintln!("[worldguard] Enabled water breathing mode for {name} (player is in group 'wg-amphibious')");
         }
-    }
-
-    /// The words that complete the last word of `rest` (what follows `/rg `).
-    fn complete_region(&self, host: &mut dyn ServerHost, uuid: u128, rest: &str) -> Vec<String> {
-        let tokens: Vec<&str> = rest.split(' ').collect();
-        let n = tokens.len() - 1;
-        let prefix = tokens[n];
-        let (op_level, player_commands, world_of_player) = {
-            let st = lock(&self.st);
-            let dimension = host
-                .player(uuid)
-                .and_then(|p| p.entity().level(&*host))
-                .map(|l| l.dimension_id().to_string())
-                .unwrap_or_else(|| OVERWORLD.to_owned());
-            (st.guard.cfg.op_level, st.guard.cfg.player_commands.clone(), st.guard.cfg.world_of(&dimension))
-        };
-        let mut out: Vec<String> = Vec::new();
-        let add = |out: &mut Vec<String>, word: &str| {
-            if starts_with_any_case(word, prefix) && !out.iter().any(|w| w == word) {
-                out.push(word.to_owned());
-            }
-        };
-        let usages = rg_usage_words();
-        if n == 0 {
-            for u in usages {
-                if may_rg_sub(host, uuid, op_level, &player_commands, &u[0]) {
-                    add(&mut out, &u[0]);
-                }
-            }
-            return out;
-        }
-        let Some(sub) = commands::canonical(tokens[0]) else { return out };
-        if !may_rg_sub(host, uuid, op_level, &player_commands, sub) {
-            return out;
-        }
-        // `-w <world>` typed before the cursor names the world the region ids come from.
-        let world = tokens[..n]
-            .windows(2)
-            .find(|w| w[0].eq_ignore_ascii_case("-w"))
-            .map(|w| w[1].to_owned())
-            .unwrap_or(world_of_player);
-        for usage in usages {
-            if usage[0] != sub {
-                continue;
-            }
-            for i in 1..=n {
-                let Some(word) = usage.get(i) else { break };
-                let arg = usage_arg(word);
-                if i < n {
-                    // A word typed before the cursor has to fit the usage's word at that place.
-                    let typed = tokens[i];
-                    let fits = match arg {
-                        None => typed.eq_ignore_ascii_case(word),
-                        Some((_, "integer")) => typed.parse::<i64>().is_ok(),
-                        Some(_) => true,
-                    };
-                    if !fits {
-                        break;
-                    }
-                    continue;
-                }
-                match arg {
-                    None => add(&mut out, word),
-                    Some((name, kind)) => match (name, kind) {
-                        ("id", _) | ("parent", _) => {
-                            let st = lock(&self.st);
-                            if let Some(w) = st.guard.worlds.get(&world) {
-                                for r in w.all() {
-                                    add(&mut out, &r.id);
-                                }
-                            }
-                            add(&mut out, "__global__");
-                        }
-                        ("world", _) => {
-                            let st = lock(&self.st);
-                            for w in st.guard.worlds.keys() {
-                                add(&mut out, w);
-                            }
-                        }
-                        ("group", _) => {
-                            for g in ["all", "members", "owners", "nonmembers", "nonowners", "none"] {
-                                add(&mut out, g);
-                            }
-                        }
-                        ("value", _) => {
-                            // `flag <id> <flag-name> [-g <group>] [value]`: the flag's own value words.
-                            let flag = usage.get(2).and_then(|f| wg::flags::FLAGS.iter().find(|d| d.name == f.as_str()));
-                            if let Some(def) = flag {
-                                let values: &[&str] = match def.kind {
-                                    wg::flags::Kind::State => &["allow", "deny"],
-                                    wg::flags::Kind::Bool => &["true", "false"],
-                                    wg::flags::Kind::GameMode => &["survival", "creative", "adventure", "spectator"],
-                                    _ => &[],
-                                };
-                                for v in values {
-                                    add(&mut out, v);
-                                }
-                            }
-                        }
-                        ("player", _) | ("others", _) | ("owners", _) | ("names", _) => {
-                            for p in host.players().server_players() {
-                                if let Some(name) = p.name(host) {
-                                    add(&mut out, &name);
-                                }
-                            }
-                        }
-                        _ => {}
-                    },
-                }
-            }
-        }
-        out
-    }
-
-    /// The words that complete the last word of `rest` (what follows `/wg `).
-    fn complete_wg(&self, host: &mut dyn ServerHost, uuid: u128, rest: &str) -> Vec<String> {
-        if rest.contains(' ') {
-            return Vec::new();
-        }
-        let op_level = lock(&self.st).guard.cfg.op_level;
-        ["version", "reload", "flushstates", "running", "report", "profile", "stopprofile", "debug"]
-            .iter()
-            .filter(|sub| wg_node(sub).is_none_or(|node| may(&mut *host, uuid, node, op_level)))
-            .filter(|sub| starts_with_any_case(sub, rest))
-            .map(|sub| (*sub).to_owned())
-            .collect()
     }
 }
 
@@ -2234,23 +2133,7 @@ impl Hooks for Mod {
     }
 
     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
-        // The tree of the original's commands (`tree_usages`) so the client lists the sub commands and their
-        // arguments and asks the server for the words (`tab_complete`). `/rg` keeps level 0 (non-operators may run
-        // what `player-commands` lists; `run` checks the rest); `/wg` and the general commands are level 0 too:
-        // every path checks its node in `command_lines` (wg_node / general_command) before anything runs.
-        // A catch-all `<args:text>` per root stays: WorldGuard takes its options in any order (`list -p Notch 2`),
-        // the tree only the usual ones, and the rest of the line must still reach `command_lines`.
-        for usage in tree_usages() {
-            let root = usage.split_whitespace().next().unwrap_or_default().to_owned();
-            let mut command = Command::new(&cmdkit::ask(usage, MOD_ID));
-            for alias in aliases_of(&root) {
-                command = command.alias(alias);
-            }
-            event.commands.push(command);
-        }
-        for root in OUR_ROOTS {
-            event.commands.push(Command::new(&format!("{root} <args:text>")));
-        }
+        event.commands.extend(root_commands());
     }
 
     fn run_mod_command(
@@ -3882,16 +3765,13 @@ impl Hooks for Mod {
     fn tab_complete(&self, host: &mut dyn ServerHost, event: &mut TabCompleteEvent<'_>) {
         let command: &str = event.command;
         let Some(first_space) = command.find(' ') else { return };
-        let root = command[..first_space].to_ascii_lowercase();
-        let rest = &command[first_space + 1..];
-        let words = match root.as_str() {
-            "rg" | "region" | "regions" => self.complete_region(&mut *host, event.player, rest),
-            "wg" | "worldguard" => self.complete_wg(&mut *host, event.player, rest),
-            _ => return,
-        };
+        if !OUR_ROOTS.contains(&command[..first_space].to_ascii_lowercase().as_str()) {
+            return;
+        }
+        let names: Vec<String> = online(&*host).into_iter().map(|p| p.name).collect();
         let word_start = command.rfind(' ').map_or(0, |i| i + 1);
         let (from, to) = (event.range[0], event.range[1]);
-        for w in words {
+        for w in paper_words(&names, command) {
             // The engine's range may begin before the word (it took the rest of the line for one argument).
             let text = if word_start >= from { format!("{}{}", &command[from..word_start], w) } else { w };
             if !event.suggestions.iter().any(|s| s.text == text) {
