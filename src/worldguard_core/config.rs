@@ -102,7 +102,7 @@ exit-deny = "&c&lHey!&7 You are not permitted to leave this area."
 #   disable-death-messages, default.pumpkin-scuba, simulation.sponge.*, chest-protection.*, and the blacklist
 #   (`blacklist.use-as-whitelist`, `blacklist.logging.console.enable`; the rules are in each world's
 #   `blacklist.txt`).
-# Needing the engine branch fam-worldguard-gameplay-cancels (cargo feature `wave2`): gameplay.block-potions (a list of
+# Of the engine branch fam-worldguard-gameplay-cancels: gameplay.block-potions (a list of
 # effect names), gameplay.block-potions-overly-reliably, gameplay.disable-conduit-effects, mobs.anti-wolf-dumbness,
 # protection.remove-infinite-stacks. protection.item-durability (default true) is read but needs an engine hook.
 # A world's own `<data-folder>/worlds/<world>/config.yml` (WorldGuard's layout) overrides these for

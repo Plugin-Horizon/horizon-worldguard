@@ -28,11 +28,9 @@ use mod_api::{
     ArmorEquipCancelEvent, BlockGrowthCancelEvent, BlockPhysicsCancelEvent, EntityTravelToDimensionEvent,
     EquipmentSlot, LivingHealCauseCancelEvent, PortalCreateEntityCancelEvent, TeleportCommandEvent,
 };
-// The hooks of the engine branches fam-worldguard-gameplay-cancels and fam-diagnostics-profiler (not in the mod SDK
-// yet; written from their drafts, first build pending). Off by default: `--features wave2` once the SDK has them.
-#[cfg(feature = "wave2")]
+// The hooks of the engine branches fam-worldguard-gameplay-cancels and fam-diagnostics-profiler.
 use mod_api::{
-    LivingIncomingDamageDetailEvent, MobEffectApplyCancelEvent, PlayerOversizeStackEvent, EventTraceRefusal,
+    TntPrimedDetailEvent, LivingIncomingDamageDetailEvent, MobEffectApplyCancelEvent, PlayerOversizeStackEvent, EventTraceRefusal,
     ProfileHandle, ProfileLevel, ProfileRefusal, ProfileScope,
 };
 use std::cell::RefCell;
@@ -128,7 +126,6 @@ struct State {
     potion_override: HashSet<u128>,
     infinite_override: HashSet<u128>,
     /// The session of `/wg profile` (the handle and who started it), when one runs.
-    #[cfg(feature = "wave2")]
     profile: Option<(ProfileHandle, String, bool)>,
     /// `heal-*` / `feed-*` timers.
     vitals: Vitals,
@@ -175,7 +172,6 @@ impl Default for State {
             migrated: false,
             potion_override: HashSet::new(),
             infinite_override: HashSet::new(),
-            #[cfg(feature = "wave2")]
             profile: None,
             vitals: Vitals::default(),
             bypass: HashSet::new(),
@@ -1035,20 +1031,14 @@ impl Mod {
                 drop(st);
                 self.debug_command(host, sender, arg)
             }
-            // The profiler of the engine branch fam-diagnostics-profiler (cargo feature `wave2`).
-            #[cfg(feature = "wave2")]
+            // The profiler of the engine branch fam-diagnostics-profiler.
             "profile" => {
                 drop(st);
                 self.profile_command(host, sender, arg)
             }
-            #[cfg(feature = "wave2")]
             "stopprofile" => {
                 drop(st);
                 self.stop_profile_command(host)
-            }
-            #[cfg(not(feature = "wave2"))]
-            "profile" | "stopprofile" => {
-                vec![format!("&c/wg {sub} is not available on this Horizon build (it needs the profiler host calls).")]
             }
             _ => vec![
                 "&cUnknown subcommand. Use /wg reload, flushstates, running, report, profile, stopprofile, debug or version.".into(),
@@ -1062,7 +1052,6 @@ impl Mod {
     fn debug_command(&self, host: &mut dyn ServerHost, sender: Option<&Snap>, arg: &str) -> Vec<String> {
         let (sub, rest) = arg.split_once(' ').map_or((arg, ""), |(a, b)| (a, b.trim()));
         let sub = sub.to_ascii_lowercase();
-        #[cfg(feature = "wave2")]
         if sub == "trace" {
             return self.trace_command(host, rest);
         }
@@ -1173,7 +1162,6 @@ impl Mod {
     /// (`profiler_start`): it records what each mod hook, tick step, mob type and block entity type took, for 1 to
     /// 10 minutes, and ends by itself. `-t` keeps the rows whose name contains the text (WorldGuard's thread filter),
     /// `-c` adds the block entities per chunk, `-i` is checked and ignored (the engine times every tick).
-    #[cfg(feature = "wave2")]
     fn profile_command(&self, host: &mut dyn ServerHost, sender: Option<&Snap>, arg: &str) -> Vec<String> {
         let (mut pastebin, mut chunks) = (false, false);
         let (mut filter, mut interval, mut minutes): (Option<String>, Option<i64>, Option<i64>) = (None, None, None);
@@ -1217,7 +1205,7 @@ impl Mod {
         match host.profiler_start(ProfileScope::new(level, ticks, filter)) {
             Ok(handle) => {
                 lock(&self.st).profile = Some((handle, sender.map(|s| s.name.clone()).unwrap_or_default(), pastebin));
-                let mut out = vec![
+                let out = vec![
                     format!("&dStarting profiling. Results will be available in {} minutes.", ticks / 1200),
                     "&7Use &b/wg stopprofile&7 at any time to cancel profiling.".to_owned(),
                 ];
@@ -1233,7 +1221,6 @@ impl Mod {
         }
     }
 
-    #[cfg(feature = "wave2")]
     fn stop_profile_command(&self, host: &mut dyn ServerHost) -> Vec<String> {
         let Some((handle, _, _)) = lock(&self.st).profile.take() else {
             return vec!["&cNo profile is currently running.".to_owned()];
@@ -1243,7 +1230,6 @@ impl Mod {
     }
 
     /// Once a second: a finished session is written to `profile.txt` and its starter is told.
-    #[cfg(feature = "wave2")]
     fn finish_profile(&self, host: &mut dyn ServerHost) {
         use wg::debug::Row;
         let Some((handle, who, pastebin)) = lock(&self.st).profile.clone() else { return };
@@ -1305,7 +1291,6 @@ impl Mod {
 
     /// `/wg debug trace start <player> [limit] | take | stop`: which mod listener ran in a player's turns and what it
     /// cost (`event_trace_*`), the closest Horizon has to replaying an event for a player.
-    #[cfg(feature = "wave2")]
     fn trace_command(&self, host: &mut dyn ServerHost, rest: &str) -> Vec<String> {
         let mut w = rest.split_whitespace();
         match w.next().unwrap_or("") {
@@ -2219,7 +2204,6 @@ impl Hooks for Mod {
         // `worldguard.region.bypass.<world>`, asked once a second, before the lock is taken.
         if lock(&self.st).ticks % TPS == 0 {
             self.refresh_bypass(&mut *host);
-            #[cfg(feature = "wave2")]
             self.finish_profile(&mut *host);
         }
         let mut st = lock(&self.st);
@@ -2714,16 +2698,30 @@ impl Hooks for Mod {
         }
     }
 
+    /// A click's TNT is asked here with its player; the arrow, dispenser, fire and redstone cases are asked in
+    /// `tnt_primed_detail`, which knows the level and the shooter.
     fn tnt_primed(&self, host: &mut dyn ServerHost, event: &mut TntPrimedEvent) -> Flow {
         let pos = event.pos;
         match event.player {
             Some(u) => self.player_check(host, u, |g, p| {
                 g.tnt_prime(Some(p), &p.dimension.clone(), bp(pos))
             }),
+            None => Flow::Continue,
+        }
+    }
+
+    /// TNT lit by an arrow is refused for its shooter (`tnt` flag, `ProtectionDetail` of WorldGuard's
+    /// `onTNTPrime`); with no player behind it the level's own regions decide. A click was asked in `tnt_primed`.
+    fn tnt_primed_detail(&self, host: &mut dyn ServerHost, event: &mut TntPrimedDetailEvent<'_>) -> Flow {
+        let pos = event.pos;
+        match event.player {
+            Some(u) if event.cause == "projectile" => {
+                self.player_check(host, u, |g, p| g.tnt_prime(Some(p), &p.dimension.clone(), bp(pos)))
+            }
+            Some(_) => Flow::Continue,
             None => {
-                // No dimension in the event: the overworld's regions decide.
                 let st = lock(&self.st);
-                if st.guard.tnt_prime(None, OVERWORLD, bp(pos)).is_ok() {
+                if st.guard.tnt_prime(None, event.dimension, bp(pos)).is_ok() {
                     Flow::Continue
                 } else {
                     Flow::Cancel
@@ -3654,10 +3652,8 @@ impl Hooks for Mod {
         lock(&self.st).teleported.insert(event.player);
     }
 
-    /// `gameplay.disable-conduit-effects` and `gameplay.block-potions` (engine branch fam-worldguard-gameplay-cancels,
-    /// cargo feature `wave2`). The hook names the target, not who threw or drank: a target with
+    /// `gameplay.disable-conduit-effects` and `gameplay.block-potions` (engine branch fam-worldguard-gameplay-cancels). The hook names the target, not who threw or drank: a target with
     /// `worldguard.override.potions` is let through (unless `block-potions-overly-reliably`), anyone else is told.
-    #[cfg(feature = "wave2")]
     fn mob_effect_apply_cancel(&self, host: &mut dyn ServerHost, event: &mut MobEffectApplyCancelEvent<'_>) -> Flow {
         let dimension = host
             .entity(event.entity as u32)
@@ -3684,7 +3680,6 @@ impl Hooks for Mod {
 
     /// `protection.remove-infinite-stacks`: a stack above its item's maximum is removed the moment it arrives
     /// (the original removes stacks with a negative count, which the game no longer has).
-    #[cfg(feature = "wave2")]
     fn player_oversize_stack(&self, _host: &mut dyn ServerHost, event: &mut PlayerOversizeStackEvent<'_>) -> Flow {
         let mut st = lock(&self.st);
         let dimension = st.by_uuid.get(&event.player).map(|p| p.dimension.clone()).unwrap_or_else(|| OVERWORLD.to_owned());
@@ -3696,7 +3691,6 @@ impl Hooks for Mod {
     }
 
     /// `mobs.anti-wolf-dumbness`: a tamed wolf takes no damage.
-    #[cfg(feature = "wave2")]
     fn living_incoming_damage_detail(
         &self,
         _level: &mut dyn LevelRandomHost,

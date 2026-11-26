@@ -1196,6 +1196,17 @@ mod tests {
     }
 
     #[test]
+    fn tnt_lit_by_an_arrow_asks_the_shooter() {
+        let g = lobby_guard();
+        let shooter = player(1, 0, [0.5, 64.0, 0.5]);
+        let op = player(3, 4, [0.5, 64.0, 0.5]);
+        let at = BlockPos::new(0, 63, 0);
+        assert!(g.tnt_prime(Some(&shooter), "minecraft:overworld", at).is_err());
+        assert!(g.tnt_prime(Some(&op), "minecraft:overworld", at).is_ok());
+        assert!(g.tnt_prime(None, "minecraft:overworld", at).is_err());
+    }
+
+    #[test]
     fn lobby_rules() {
         let g = lobby_guard();
         let guest = player(1, 0, [0.5, 64.0, 0.5]);
