@@ -320,7 +320,6 @@ pub fn run(guard: &mut Guard, ctx: &mut Ctx<'_>, line: &str) -> Reply {
         return r;
     };
     let Some(cmd) = canonical(first) else {
-        r.err(format!("Unknown subcommand '{first}'."));
         help(&mut r);
         return r;
     };
@@ -375,12 +374,11 @@ pub fn run(guard: &mut Guard, ctx: &mut Ctx<'_>, line: &str) -> Reply {
     r
 }
 
+/// What the original prints for `/rg`, `/rg help` and an unknown sub command (Intake's usage line, in its own order).
+pub const USAGE: &str = "/region <select|flag|migrateuuid|migrateheights|setpriority|teleport|save|flags|addowner|list|removeowner|remove|addmember|redefine|removemember|load|define|claim|toggle-bypass|setparent|info|migratedb>";
+
 fn help(r: &mut Reply) {
-    r.print("/region (/rg) subcommands:");
-    for (name, usage, _, _) in SPECS {
-        let name = if *name == "bypass" { "toggle-bypass" } else { name };
-        r.debug(format!("  /rg {name} {usage}").trim_end().to_owned());
-    }
+    r.err(USAGE);
 }
 
 type Res = Result<(), String>;
@@ -1857,6 +1855,17 @@ mod tests {
 
     fn has(r: &Reply, text: &str) -> bool {
         r.lines.iter().any(|l| l.contains(text))
+    }
+
+    #[test]
+    fn no_sub_command_help_and_an_unknown_one_print_the_usage_line_only() {
+        let mut g = Guard::new(Config::default());
+        let mut sel = Store::default();
+        let op = player(9, 4);
+        for line in ["", "help", "bogus"] {
+            let r = run_as(&mut g, &mut sel, Some(&op), line);
+            assert_eq!(r.lines, vec![format!("&c{USAGE}")], "{line}");
+        }
     }
 
     #[test]

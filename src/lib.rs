@@ -978,12 +978,12 @@ impl Mod {
                             st.tracker.forget(uuid);
                             vec![format!("&dCleared states for player \"{arg}\".")]
                         }
-                        None => vec![format!("&cNo players matched query '{arg}'.")],
+                        None => vec![NO_PLAYERS.to_owned()],
                     }
                 }
             }
             "running" | "queue" => vec!["&dThere are currently no running tasks.".into()],
-            "" | "version" => vec![
+            "version" => vec![
                 // The Java plugin's version (gradle.properties of the WorldGuard source this port follows).
                 "&dWorldGuard 7.0.22-SNAPSHOT".to_owned(),
                 "&dhttp://www.enginehub.org".to_owned(),
@@ -1041,9 +1041,7 @@ impl Mod {
                 drop(st);
                 self.stop_profile_command(host)
             }
-            _ => vec![
-                "&cUnknown subcommand. Use /wg reload, flushstates, running, report, profile, stopprofile, debug or version.".into(),
-            ],
+            _ => vec![format!("&c{WG_USAGE}")],
         }
     }
 
@@ -1384,6 +1382,7 @@ impl Mod {
             "god" | "ungod" | "heal" | "slay" => self.general_command(host, root, sender, args),
             "stopfire" | "allowfire" => self.fire_command(host, root, sender, args),
             "halt-activity" | "stoplag" | "haltactivity" => self.halt_command(host, root, sender, args),
+            "stack" if !args.trim().is_empty() => vec!["&cToo many arguments.".to_owned(), "&c/stack".to_owned()],
             "stack" => self.stack_command(host, sender),
             "locate" => self.locate_command(host, sender, args),
             _ => {
@@ -1406,7 +1405,7 @@ impl Mod {
         let st = lock(&self.st);
         if query == "*" {
             let all: Vec<(u128, String)> = st.by_uuid.values().map(|p| (p.uuid, p.name.clone())).collect();
-            return if all.is_empty() { Err("&cNo players matched query.".to_owned()) } else { Ok(all) };
+            return if all.is_empty() { Err(NO_PLAYERS.to_owned()) } else { Ok(all) };
         }
         let q = query.to_ascii_lowercase();
         let online: Vec<&Snap> = st.by_uuid.values().collect();
@@ -1416,7 +1415,7 @@ impl Mod {
         let partial: Vec<&&Snap> = online.iter().filter(|p| p.name.to_ascii_lowercase().starts_with(&q)).collect();
         match partial.as_slice() {
             [p] => Ok(vec![(p.uuid, p.name.clone())]),
-            [] => Err(format!("&cNo players matched query '{query}'.")),
+            [] => Err(NO_PLAYERS.to_owned()),
             _ => Err("&cMore than one player found! Use the exact name or '*'.".to_owned()),
         }
     }
@@ -1500,8 +1499,10 @@ impl Mod {
                     }
                 }
                 _ => {
-                    // The name comes from the players seen on this server, never from the typed text.
-                    lock(&self.st).commands.push(format!("kill {name}"));
+                    // `setHealth(0)`: the player dies of generic damage, at once, so the death message comes before "Slain!".
+                    if let Some(player) = host.player(uuid) {
+                        let _ = player.entity().hurt(&mut *host, "minecraft:generic", f32::MAX, None, None);
+                    }
                 }
             }
             if own {
@@ -1635,10 +1636,7 @@ impl Mod {
         }
         let halt = !lift;
         if halt && !words.first().is_some_and(|w| w.eq_ignore_ascii_case("confirm")) {
-            return vec![
-                "&cThis command will &c&lPERMANENTLY&r&c erase ALL animals in ALL loaded chunks in ALL loaded worlds.".to_owned(),
-                format!("&aType &f/{root} confirm&c to confirm."),
-            ];
+            return vec![HALT_CONFIRM.to_owned()];
         }
         lock(&self.st).guard.activity_halted = halt;
         let name = sender.map_or("Console".to_owned(), |s| s.name.clone());
@@ -1762,6 +1760,16 @@ fn append_log_line(path: &Path, line: &str) {
         eprintln!("[worldguard] Could not write the blacklist log: {e}");
     }
 }
+
+/// What `/wg` and `/worldguard` print without a sub command, with `help` or an unknown one (always the long name).
+const WG_USAGE: &str = "/worldguard <running|debug|reload|stopprofile|profile|flushstates|report|version>";
+
+/// `PlayerMatcher`: the reply when a name matches nobody (the query is not repeated).
+const NO_PLAYERS: &str = "&cNo players matched query.";
+
+/// The one chat line `/halt-activity` prints before it asks for `confirm` (the clickable part, then the typed command; the
+/// aliases `stoplag` and `haltactivity` show the same line).
+const HALT_CONFIRM: &str = "&cThis command will &c&lPERMANENTLY&r&c erase ALL animals in ALL loaded chunks in ALL loaded worlds. &a[Click]&c or type &f/halt-activity confirm&c to confirm.";
 
 const NO_PERMISSION: &str = "&cYou don't have permission to do that.";
 
@@ -1910,6 +1918,16 @@ mod tree_tests {
         let mut want: Vec<String> = OUR_ROOTS.iter().map(|r| (*r).to_owned()).collect();
         want.sort();
         assert_eq!(names, want);
+    }
+
+    #[test]
+    fn the_replies_are_the_lines_paper_shows() {
+        assert_eq!(text::plain(&format!("{WG_USAGE}")), "/worldguard <running|debug|reload|stopprofile|profile|flushstates|report|version>");
+        assert_eq!(text::plain(NO_PLAYERS), "No players matched query.");
+        assert_eq!(
+            text::plain(HALT_CONFIRM),
+            "This command will PERMANENTLY erase ALL animals in ALL loaded chunks in ALL loaded worlds. [Click] or type /halt-activity confirm to confirm."
+        );
     }
 
     #[test]
