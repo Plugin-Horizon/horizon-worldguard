@@ -5,6 +5,7 @@
 
 pub mod worldguard_core;
 mod chest_world;
+mod cmdkit;
 use mod_api::{
     ModServiceCallEvent, TriState, ArmorStandManipulateEvent, AttackEntityEvent, BlockBurnEvent, BlockIgniteEvent,
     BlockSpreadEvent, BreakBlockEvent, BucketEmptyEvent, CanPlayerSleepEvent, Command,
@@ -1779,6 +1780,116 @@ fn wg_node(args: &str) -> Option<&'static str> {
     }
 }
 
+// --- the command tree ---------------------------------------------------------------------------------------------
+
+/// The roots that share another root's usages: `/rg` also answers to `/region` and `/regions`, `/wg` to `/worldguard`.
+fn aliases_of(root: &str) -> &'static [&'static str] {
+    match root {
+        "rg" => &["region", "regions"],
+        "wg" => &["worldguard"],
+        "halt-activity" => &["stoplag", "haltactivity"],
+        _ => &[],
+    }
+}
+
+/// Every usage of WorldGuard's commands, root first: `/rg` (`commands::usages`), `/wg` and the general commands
+/// (`GeneralCommands`, `FlagCommands`, `WorldGuardCommands` of the original).
+fn tree_usages() -> &'static Vec<String> {
+    static USAGES: OnceLock<Vec<String>> = OnceLock::new();
+    USAGES.get_or_init(|| {
+        let mut out: Vec<String> = vec!["rg".to_owned()];
+        out.extend(commands::usages().into_iter().map(|u| format!("rg {u}")));
+        for u in [
+            "wg",
+            "wg version",
+            "wg reload",
+            "wg report",
+            "wg report -p",
+            "wg flushstates",
+            "wg flushstates <player:word>",
+            "wg running",
+            "wg profile [options:text]",
+            "wg stopprofile",
+            "wg debug [args:text]",
+            "god",
+            "god -s",
+            "god <player:word>",
+            "god -s <player:word>",
+            "ungod",
+            "ungod -s",
+            "ungod <player:word>",
+            "ungod -s <player:word>",
+            "heal",
+            "heal -s",
+            "heal <player:word>",
+            "heal -s <player:word>",
+            "slay",
+            "slay -s",
+            "slay <player:word>",
+            "slay -s <player:word>",
+            "stopfire [world:word]",
+            "allowfire [world:word]",
+            "halt-activity",
+            "halt-activity -c",
+            "halt-activity -i",
+            "halt-activity -s",
+            "halt-activity confirm",
+            "stack",
+            "locate [player:word]",
+        ] {
+            out.push(u.to_owned());
+        }
+        out
+    })
+}
+
+#[cfg(test)]
+mod tree_tests {
+    use super::*;
+
+    fn paths() -> Vec<String> {
+        cmdkit::literal_paths(tree_usages())
+    }
+
+    #[test]
+    fn the_region_commands_of_the_original_are_in_the_tree() {
+        let paths = paths();
+        for sub in [
+            "define", "redefine", "claim", "select", "info", "list", "flags", "flag", "setpriority", "setparent", "remove",
+            "addmember", "addowner", "removemember", "removeowner", "teleport", "load", "save", "migratedb", "migrateuuid",
+            "migrateheights",
+        ] {
+            assert!(paths.iter().any(|p| p == &format!("rg {sub}") || p.starts_with(&format!("rg {sub} "))), "rg {sub}");
+        }
+        assert!(paths.contains(&"rg flag pvp".to_owned()));
+        assert!(paths.contains(&"rg flag greeting".to_owned()));
+        assert!(paths.contains(&"rg list -p".to_owned()));
+    }
+
+    #[test]
+    fn the_general_and_wg_commands_of_the_original_are_in_the_tree() {
+        let paths = paths();
+        for want in [
+            "wg version", "wg reload", "wg report", "wg flushstates", "wg running", "wg profile", "god", "ungod", "heal", "slay",
+            "stopfire", "allowfire", "halt-activity", "stack", "locate",
+        ] {
+            assert!(paths.iter().any(|p| p == want || p.starts_with(&format!("{want} "))), "{want}");
+        }
+    }
+
+    #[test]
+    fn every_usage_names_only_registered_kinds() {
+        for u in tree_usages() {
+            let asked = cmdkit::ask(u, MOD_ID);
+            assert!(!asked.contains(":player_name"), "{asked}");
+            for token in asked.split_whitespace().filter(|t| t.starts_with('<') || t.starts_with('[')) {
+                let kind = token.trim_matches(|c| "<>[]".contains(c)).split_once(':').unwrap().1;
+                assert!(["integer", "worldguard:word", "worldguard:text", "text"].contains(&kind), "{kind} in {asked}");
+            }
+        }
+    }
+}
+
 // --- slash forms ----------------------------------------------------------------------------------
 //
 // WorldGuard's commands (`/god`, `/rg`, `/wg`...) exist with ONE slash only; `//god` is not a command. The
@@ -2118,26 +2229,27 @@ impl Hooks for Mod {
         lock(&self.st).save_dirty();
     }
 
+    fn register(&self, registrar: &mut dyn mod_api::Registrar, _: &mod_api::RegistrationContext) {
+        cmdkit::register(registrar);
+    }
+
     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
-        // One text argument per root: arismoko's dispatcher hands the typed line to
-        // `run_mod_command`, which runs the subcommand. `/rg` keeps level 0 (non-operators may run
-        // what `player-commands` lists; `run` checks the rest). `/wg` is level 2.
-        for root in ["rg", "region", "regions"] {
-            event.commands.push(Command::new(root));
-            event
-                .commands
-                .push(Command::new(&format!("{root} <args:text>")));
+        // The tree of the original's commands (`tree_usages`) so the client lists the sub commands and their
+        // arguments and asks the server for the words (`tab_complete`). `/rg` keeps level 0 (non-operators may run
+        // what `player-commands` lists; `run` checks the rest); `/wg` and the general commands are level 0 too:
+        // every path checks its node in `command_lines` (wg_node / general_command) before anything runs.
+        // A catch-all `<args:text>` per root stays: WorldGuard takes its options in any order (`list -p Notch 2`),
+        // the tree only the usual ones, and the rest of the line must still reach `command_lines`.
+        for usage in tree_usages() {
+            let root = usage.split_whitespace().next().unwrap_or_default().to_owned();
+            let mut command = Command::new(&cmdkit::ask(usage, MOD_ID));
+            for alias in aliases_of(&root) {
+                command = command.alias(alias);
+            }
+            event.commands.push(command);
         }
-        // `/wg` and the general commands are level 0 too: every path checks its node in
-        // `command_lines` (wg_node / general_command) before anything runs.
-        for root in [
-            "wg", "worldguard", "god", "ungod", "heal", "slay", "stopfire", "allowfire", "halt-activity", "stoplag",
-            "haltactivity", "stack", "locate",
-        ] {
-            event.commands.push(Command::new(root));
-            event
-                .commands
-                .push(Command::new(&format!("{root} <args:text>")));
+        for root in OUR_ROOTS {
+            event.commands.push(Command::new(&format!("{root} <args:text>")));
         }
     }
 
@@ -2156,9 +2268,14 @@ impl Hooks for Mod {
         ) {
             return Flow::Continue;
         }
+        // The catch-all's text, or the words of the tree usage that matched, without the root.
         let args = match event.command.argument("args") {
             Some(CommandArgumentValue::String(s)) => s.clone(),
-            _ => String::new(),
+            _ if event.command.arguments.is_empty() && event.command.literals.len() == 1 => String::new(),
+            _ => {
+                let line = cmdkit::rebuild(tree_usages(), &event.command);
+                line.split_once(' ').map(|(_, rest)| rest.to_owned()).unwrap_or_default()
+            }
         };
         match *event.source {
             CommandSource::Player { player, .. } => {
