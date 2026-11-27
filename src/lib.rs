@@ -1762,6 +1762,9 @@ fn append_log_line(path: &Path, line: &str) {
 }
 
 /// What `/wg` and `/worldguard` print without a sub command, with `help` or an unknown one (always the long name).
+/// The vanilla command roots WorldGuard's commands replace.
+const OVERRIDDEN_ROOTS: &[&str] = &["locate"];
+
 const WG_USAGE: &str = "/worldguard <running|debug|reload|stopprofile|profile|flushstates|report|version>";
 
 /// `PlayerMatcher`: the reply when a name matches nobody (the query is not repeated).
@@ -1869,6 +1872,12 @@ fn tree_usages() -> &'static Vec<String> {
 
 #[cfg(test)]
 mod tree_tests {
+    #[test]
+    fn locate_replaces_the_vanilla_command() {
+        assert_eq!(super::OVERRIDDEN_ROOTS, ["locate"]);
+        assert!(super::root_commands().iter().any(|c| c.usage().starts_with("locate")));
+    }
+
     use super::*;
 
     fn paths() -> Vec<String> {
@@ -2148,6 +2157,10 @@ impl Hooks for Mod {
 
     fn register(&self, registrar: &mut dyn mod_api::Registrar, _: &mod_api::RegistrationContext) {
         cmdkit::register(registrar);
+        // Bukkit-style: WorldGuard's `/locate [player]` replaces the vanilla command (Paper runs WG's).
+        for root in OVERRIDDEN_ROOTS {
+            registrar.override_vanilla_command(root);
+        }
     }
 
     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
