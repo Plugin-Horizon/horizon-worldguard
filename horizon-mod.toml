@@ -1,6 +1,6 @@
 id = "worldguard"
 name = "WorldGuard"
-version = "1.001.0"
+version = "1.1.0"
 description = "Region protection (WorldGuard rules and /rg, /wg commands) for Horizon servers, as a native trait mod."
 authors = ["LionSpacer"]
 api = "0.2"
