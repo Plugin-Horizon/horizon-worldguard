@@ -320,7 +320,6 @@ pub fn run(guard: &mut Guard, ctx: &mut Ctx<'_>, line: &str) -> Reply {
         return r;
     };
     let Some(cmd) = canonical(first) else {
-        r.err(format!("Unknown subcommand '{first}'."));
         help(&mut r);
         return r;
     };
@@ -375,12 +374,11 @@ pub fn run(guard: &mut Guard, ctx: &mut Ctx<'_>, line: &str) -> Reply {
     r
 }
 
+/// What the original prints for `/rg`, `/rg help` and an unknown sub command (Intake's usage line, in its own order).
+pub const USAGE: &str = "/region <select|flag|migrateuuid|migrateheights|setpriority|teleport|save|flags|addowner|list|removeowner|remove|addmember|redefine|removemember|load|define|claim|toggle-bypass|setparent|info|migratedb>";
+
 fn help(r: &mut Reply) {
-    r.print("/region (/rg) subcommands:");
-    for (name, usage, _, _) in SPECS {
-        let name = if *name == "bypass" { "toggle-bypass" } else { name };
-        r.debug(format!("  /rg {name} {usage}").trim_end().to_owned());
-    }
+    r.err(USAGE);
 }
 
 type Res = Result<(), String>;
@@ -1234,14 +1232,6 @@ fn set_flag(guard: &mut Guard, ctx: &mut Ctx<'_>, a: &Args, r: &mut Reply) -> Re
             if ctx.sender.is_none() {
                 r.raw("https://worldguard.enginehub.org/en/latest/regions/flags/#overrides");
             }
-        } else if matches!(def.name, "weather-lock" | "time-lock") {
-            // HMOD-GAP(player_weather_time): no per-player weather or time on Horizon main.
-            r.raw("&c&lWARNING:&c This flag has no effect on this server.".to_owned());
-            r.raw("&dThe value is saved, but players cannot be given their own weather or time yet.".to_owned());
-        } else if def.name == "potion-splash" {
-            // HMOD-GAP(potion_splash_cancel): the splash hook cannot cancel or weaken a hit.
-            r.raw("&c&lWARNING:&c This flag only stops lingering clouds.".to_owned());
-            r.raw("&dSplash potions still reach what stands in the region.".to_owned());
         }
     }
     {
@@ -1525,7 +1515,7 @@ fn add_people(guard: &mut Guard, ctx: &mut Ctx<'_>, a: &Args, r: &mut Reply, own
             && !w.ancestors(&id).iter().any(|p| !p.owners.is_empty())
             && let Some(p) = ctx.sender
             && !guard.is_admin(p)
-            // HMOD-GAP(region-scoped-nodes): `addowner.unclaimed.<id>` is per region and cannot be declared; refused here.
+            // `addowner.unclaimed.<id>` is per region: the host declares it the first time it is asked.
             && !ctx
                 .players
                 .has_permission(p.subject.uuid, &format!("worldguard.region.addowner.unclaimed.{id}"))
@@ -1777,6 +1767,39 @@ fn migrate_uuid(guard: &mut Guard, ctx: &mut Ctx<'_>, r: &mut Reply) -> Res {
         return Err(NO_PERMISSION.into());
     }
     r.print("Now performing migration... this may take a while.");
+    // UUIDMigration: every name in an owner or member list is looked up; a name that resolves moves to
+    // `unique-ids`, one that does not stays a name (`keep-names-that-lack-uuids` defaults to true). The lookup is
+    // the server's own (online players and its user cache), not Mojang's.
+    let mut unresolved = false;
+    let worlds: Vec<String> = guard.worlds.keys().cloned().collect();
+    for name in worlds {
+        let dim = dimension_of_world(guard, &name);
+        let w = guard.world_mut(&dim);
+        let ids: Vec<String> = w.all().map(|x| x.id.clone()).collect();
+        for id in ids {
+            let Some(reg) = w.get_mut(&id) else { continue };
+            for domain in [&mut reg.owners, &mut reg.members] {
+                let names = std::mem::take(&mut domain.players);
+                for n in names {
+                    match ctx.players.resolve(&n) {
+                        Some((uuid, _)) => {
+                            let s = uuid_string(uuid);
+                            if !domain.unique_ids.contains(&s) {
+                                domain.unique_ids.push(s);
+                            }
+                        }
+                        None => {
+                            unresolved = true;
+                            domain.players.push(n);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if unresolved {
+        r.print("Some member and owner names do not seem to exist or own Minecraft so they could not be converted into UUIDs. They have been left as names, but the conversion can be re-run with 'keep-names-that-lack-uuids' set to false in the configuration in order to remove these names. Leaving the names means that someone can register with one of these names in the future and become that player.");
+    }
     r.print("Migration complete!");
     Ok(())
 }
@@ -1835,6 +1858,17 @@ mod tests {
     }
 
     #[test]
+    fn no_sub_command_help_and_an_unknown_one_print_the_usage_line_only() {
+        let mut g = Guard::new(Config::default());
+        let mut sel = Store::default();
+        let op = player(9, 4);
+        for line in ["", "help", "bogus"] {
+            let r = run_as(&mut g, &mut sel, Some(&op), line);
+            assert_eq!(r.lines, vec![format!("&c{USAGE}")], "{line}");
+        }
+    }
+
+    #[test]
     fn define_flag_info_remove() {
         let mut g = Guard::new(Config::default());
         let mut sel = Store::default();
@@ -1869,24 +1903,38 @@ mod tests {
     }
 
     #[test]
-    fn flags_without_an_effect_warn() {
+    fn weather_time_and_splash_flags_carry_no_warning() {
         let mut g = Guard::new(Config::default());
         let mut sel = Store::default();
         let op = player(9, 4);
         let (u, s) = cuboid_sel(9, [0, 0, 0], [10, 100, 10]);
         sel.0.insert(u, s);
         run_as(&mut g, &mut sel, Some(&op), "define plot");
-        let r = run_as(&mut g, &mut sel, Some(&op), "flag plot weather-lock clear");
-        assert_eq!(r.lines[0], "&c&lWARNING:&c This flag has no effect on this server.");
+        for line in ["flag plot weather-lock clear", "flag plot time-lock 6000", "flag plot potion-splash deny"] {
+            let r = run_as(&mut g, &mut sel, Some(&op), line);
+            assert!(!has(&r, "WARNING"), "{line}: {:?}", r.lines);
+        }
         assert_eq!(
             g.worlds["world"].get("plot").unwrap().flag("weather-lock"),
             Some(&FlagValue::Str("minecraft:clear".into())),
-            "the value is still saved"
         );
-        let r = run_as(&mut g, &mut sel, Some(&op), "flag plot potion-splash deny");
-        assert_eq!(r.lines[0], "&c&lWARNING:&c This flag only stops lingering clouds.");
-        let r = run_as(&mut g, &mut sel, Some(&op), "flag plot crop-growth deny");
-        assert!(!has(&r, "WARNING"), "{:?}", r.lines);
+    }
+
+    #[test]
+    fn migrate_uuid_moves_resolvable_names() {
+        let mut g = Guard::new(Config::default());
+        let mut sel = Store::default();
+        let op = player(9, 4);
+        let mut reg = Region::new("plot", Shape::Cuboid { min: BlockPos::new(0, 0, 0), max: BlockPos::new(10, 100, 10) });
+        reg.owners.players = vec!["alice".to_owned(), "carol".to_owned()];
+        g.world_mut("minecraft:overworld").put(reg);
+        let r = run_as(&mut g, &mut sel, Some(&op), "migrateuuid");
+        assert_eq!(r.lines.first().map(String::as_str), Some("&dNow performing migration... this may take a while."), "{:?}", r.lines);
+        assert!(has(&r, "Migration complete!"), "{:?}", r.lines);
+        assert!(has(&r, "could not be converted into UUIDs"), "carol does not resolve: {:?}", r.lines);
+        let reg = g.worlds["world"].get("plot").unwrap();
+        assert_eq!(reg.owners.unique_ids, vec![uuid_string(1)]);
+        assert_eq!(reg.owners.players, vec!["carol".to_owned()]);
     }
 
     #[test]

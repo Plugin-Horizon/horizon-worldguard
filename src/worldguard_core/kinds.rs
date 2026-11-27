@@ -517,6 +517,15 @@ pub fn is_vehicle(kind: &str) -> bool {
     k.ends_with("_boat") || k.ends_with("_raft") || k.ends_with("minecart") || k == "boat"
 }
 
+/// Bukkit's `Tameable`: what a player can be thrown from but not get back onto (`VehicleExitEvent` hold-back).
+pub fn is_tameable(kind: &str) -> bool {
+    matches!(
+        path(kind),
+        "wolf" | "cat" | "parrot" | "horse" | "donkey" | "mule" | "llama" | "trader_llama" | "camel"
+            | "skeleton_horse" | "zombie_horse" | "nautilus" | "zombie_nautilus"
+    )
+}
+
 /// `Entities.isRiddenOnUse` (without the saddle test): right clicking them is a ride, which
 /// `mount` checks.
 pub fn is_rideable(kind: &str) -> bool {

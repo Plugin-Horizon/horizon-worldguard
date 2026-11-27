@@ -2,7 +2,7 @@
 
 ## Port status
 
-Compared with WorldGuard 7.0.22-SNAPSHOT (59e136a) (estimate): **72 %** of the original's commands, permissions, config keys, messages and features work today; **72 %** once our open Horizon PRs are merged; **73 %** with the engine changes we are writing; **72 %** with the newest Horizon SDK. Estimated count: 323/450 items. Status: not yet compiled after the 2026-11-20 round.
+Compared with WorldGuard 7.0.22-SNAPSHOT (59e136a), by the item list in `audit/rec100/worldguard.md`: **98 %** of the original's commands, permissions, config keys, messages and features work today (43 of 44 items) against the combined next SDK. Round 8 (2026-11-26): the code of the engine branches `fam-worldguard-gameplay-cancels` and `fam-diagnostics-profiler` is normal code (no cargo feature).
 
 > **Unofficial Rust port of WorldGuard for the Horizon server (https://github.com/arismoko/horizon). Not affiliated with or endorsed by the WorldGuard authors.**
 
@@ -52,7 +52,7 @@ This is a native trait mod: `horizon-mod.toml`, a `Cargo.toml` that depends on `
 - Flags with their own handler: `block-trampling`, `crop-growth`, `moisture-change`, `lava-harden`,
   `exp-drops`, `enderman-grief`, `snowman-trails`, `ravager-grief`, `wind-charge-burst`,
   `natural-health-regen`, `natural-hunger-drain`, `heal-*`, `feed-*`, and `potion-splash` for lingering
-  clouds. `weather-lock` and `time-lock` are saved but have no effect (see Known gaps).
+  clouds. `weather-lock` and `time-lock` send the player their own weather and time while they stand in the region.
 
 Full list with what is partial: the Known gaps section. What Horizon lacks for the rest: the Known gaps section.
 
@@ -76,6 +76,11 @@ save-delay-seconds = 5
 player-commands = []             # /rg subcommands non-operators may run (on regions they own)
 use-player-move-event = true
 use-player-teleports = true
+auto-invincible = false          # worldguard.auto-invincible starts god mode (older name: auto-invincible-permission)
+auto-invincible-group = false    # permission group wg-invincible starts god mode
+auto-no-drowning-group = false   # permission group wg-amphibious does not drown
+use-particle-effects = true      # smoke where a break or place was refused
+uuid-migration-on-start = true   # names in owner/member lists move to unique ids at the first load
 
 [worlds]                         # world folder name per dimension
 "minecraft:overworld" = "world"
@@ -142,16 +147,14 @@ horizon-launcher native-build <path to this folder> --server-output <dir> --vers
 What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` or `HMOD-GAP(...)` in `src/`):
 
 - Colour codes are dropped (messages are plain), and titles go to the action bar.
-- Portal use and `/tp` teleports cannot be refused; a rescue teleport puts the player back on the next tick.
+- Round 2 on the next SDK (written blind, not built yet): `weather-lock` and `time-lock` (per-player `game_event` and `set_time` packets), `vine-growth` and `sculk-growth` (`natural_block_spread`, `block_grow`), `potion-splash` splash hits (`potion_splash_cancel`, read at the landing spot), `mobs.block-zombie-door-destruction` (`entity_break_door_cancel`), `player-damage.disable-death-messages` (`player_death_message`), blacklist `on-dispense` (`block_dispense`) and `ignore-groups`, `/halt-activity` removing entities, `/rg migrateuuid` (server profile lookup), region-scoped permission nodes (`permission_declare_node`, no feature gate any more).
+- Colour codes are dropped (messages are plain), and titles go to the action bar.
+- A rescue teleport (void, suffocation) puts the player back on the next tick.
 - The source entity of an explosion is not told: the nearest tracked explosive names the blast.
-- A vehicle leaving a region cannot be held back.
-- Round 3 additions are written blind (not built, not run): world options for weather, mobs, physics, fire, sponges, the blacklist (`worlds/<world>/blacklist.txt`), sign chest protection and per-world `worlds/<world>/config.yml`. What Horizon cannot do for them: `physics.no-physics-sand|gravel|allow-portal-anywhere|vine-like-rope-ladders`, `mobs.block-zombie-door-destruction|block-enderdragon-portal-creation|anti-wolf-dumbness`, growth flags other than mushrooms, `on-equip`/`on-dispense`, death messages, pumpkin scuba, conduit effects, item durability, infinite stacks, potion blocking. The void and suffocation teleports use the player's position from a few seconds earlier.
-- `weather-lock` and `time-lock` need a per-player weather and time (not on Horizon): the flags are saved, `/rg flag` warns.
-- `potion-splash` only stops lingering clouds: the splash hook cannot cancel or weaken a hit.
-- `natural-health-regen` cannot tell natural regeneration from other heals: any heal of one point or less is held back (a Regeneration effect too).
-- `lava-harden` acts on any fluid that places a block (cobblestone, stone, basalt, obsidian). `enderman-grief`, `snowman-trails` and `ravager-grief` look at the mob's own position, not the block it would change.
-- `/halt-activity` does not remove the entities that already exist. `/locate` (no compass target), `/wg profile`, `stopprofile` and `debug` (no profiler or event replay) are missing.
-- Region-scoped permission nodes (`worldguard.region.<sub>.<id>` and friends) are refused unless the cargo feature `horizon_late_permission_nodes` is on: it declares each node the first time it is asked, and needs the host method `permission_declare_node` (horizon-rust branch `api-permission_late_node_registration`, not in the pinned SDK yet).
-- The block fade, form and grow hooks (`ice-melt`, `snow-melt`, `ice-form`, `mushroom-growth`, ...) are written blind; growth flags other than mushrooms have no hook (the grow events give no block name without a host).
-- Blacklist (`worlds/<world>/blacklist.txt`, written blind): no `on-equip`/`on-dispense`, no `ignore-groups`, no database log; the file log (`blacklist.logging.file.enable`) writes WorldGuard's default path under the data folder, in UTC, and ignores `path`/`open-files`.
-- Chest protection, sponge and per-world config files are written blind (round 3); SQL region storage is not ported.
+- Round 3 (written blind, first build pending): `physics.no-physics-sand|gravel|allow-portal-anywhere|vine-like-rope-ladders` (`block_physics_cancel`, sources `falling` and `neighbor`), `grass-growth`, `mycelium-spread`, `rock-growth` (`block_growth_cancel`, kinds `grass`, `mycelium`, `dripstone`), `mobs.block-enderdragon-portal-creation` (`portal_create_entity_cancel`), `natural-health-regen` by cause (`living_heal_cause_cancel`), blacklist `on-equip` (`armor_equip_cancel`), per-player weather and time, `/locate` with and without a player (`player_set_compass_target`, `level_respawn_data`). The `next-engine` feature is gone.
+- Round 6 (written blind, first build pending): `/wg debug testbreak|testplace|testinteract|testdamage <player> [-t] [-s]` (a ray trace from the sender's eye, then the same guard checks the hooks use; the report lists WorldGuard's answer only), `worldguard.auto-invincible`, `auto-invincible-group`, `auto-no-drowning-group` (amphibious: no drowning), the `invincible` flag as a session handler (a deny beats god mode unless `worldguard.god.override-regions`; fire put out, no hunger, `invincibility-removes-mobs`), `default.pumpkin-scuba` (helmet read twice a second), the `player-portal` check (`entity_travel_to_dimension`, cause `nether_portal`), `/tp` and `/teleport` refusal for `entry` and `exit` (`teleport_command`, `exit-via-teleport` (allowed by default) lets a teleport out), a rider held on a tameable mount where `ride` is denied (`entity_mount` dismount), smoke where a break or place was refused (`use-particle-effects`), and `uuid-migration-on-start`.
+- Engine branches `fam-worldguard-gameplay-cancels` and `fam-diagnostics-profiler`: `gameplay.disable-conduit-effects` and `gameplay.block-potions` (`mob_effect_apply_cancel`; the hook names the target, not the thrower, so `worldguard.override.potions` is read for the target), `protection.remove-infinite-stacks` (`player_oversize_stack`: a stack above its item's maximum, since the game has no negative counts), `mobs.anti-wolf-dumbness` (`living_incoming_damage_detail`), `/wg profile [-p] [-i n] [-t filter] [-c] [minutes]` and `/wg stopprofile` (`profiler_start|report|stop`: the engine times mod hooks, tick steps, mob and block entity types instead of sampling threads; the report goes to `profile.txt`), and `/wg debug trace start|take|stop` (`event_trace_*`).
+- Still engine (audit `ENGINE_NEEDS.md`): `protection.item-durability` (`damage_item` only reaches items that carry a part). TNT lit by an arrow is refused for its shooter through `tnt_primed_detail`.
+- `potion-splash` is read at the landing spot of the potion, not at each affected entity. `time-lock` needs the world clock's registry id (`minecraft:world_clock` / `minecraft:overworld`); if the host does not know it, the lock is silently not shown.
+- The void and suffocation teleports use the player's position from a few seconds earlier. `lava-harden` acts on any fluid that places a block. `enderman-grief`, `snowman-trails` and `ravager-grief` look at the mob's own position. A redstone-powered sponge's toggling is not simulated.
+- Blacklist: no database log; the file log writes WorldGuard's default path or `logging.file.path`, in UTC. SQL region storage is not ported.
