@@ -8,10 +8,5 @@ publish = false
 # The pinned SDK's API crate, fetched into .horizon/sdk/ by any `cargo horizon-mod` command.
 horizon-mod-api = { path = ".horizon/sdk/api/crates/horizon-mod-api" }
 toml = "=1.1.6"
-
-[features]
-# `permission_declare_node` (horizon-rust, branch api-permission_late_node_registration, issue #18807): a region-scoped
-# node (`worldguard.region.<perm>.<id>`) is declared the first time it is asked. Off by default: the pinned SDK does
-# not have the host method yet.
-horizon_late_permission_nodes = []
-
+ureq = { version = "2", default-features = false, features = ["tls"] }
+serde_json = "1"

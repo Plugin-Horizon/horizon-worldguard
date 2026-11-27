@@ -16,6 +16,18 @@ save-delay-seconds = 5
 # /rg subcommands non-operators may run (Horizon has no permission nodes yet). Changes are then
 # limited to regions they own. Empty, as WorldGuard without a permissions plugin.
 player-commands = []
+# Players with the permission worldguard.auto-invincible start in god mode (auto-invincible-permission
+# in older WorldGuard).
+auto-invincible = false
+# Players in the permission group wg-invincible start in god mode.
+auto-invincible-group = false
+# Players in the permission group wg-amphibious do not drown.
+auto-no-drowning-group = false
+# A puff of smoke where a block break or place was refused (WorldGuard's use-particle-effects).
+use-particle-effects = true
+# Move the names in region owner and member lists to unique ids at the first load (idempotent; WorldGuard
+# switches the key off afterwards, this port leaves the file alone).
+uuid-migration-on-start = true
 
 # Greeting/farewell/entry/exit and the movement flags need this.
 use-player-move-event = true
@@ -87,9 +99,12 @@ exit-deny = "&c&lHey!&7 You are not permitted to leave this area."
 #   block-painting-destroy / block-item-frame-destroy / block-armor-stand-destroy / block-vehicle-entry /
 #   block-zombie-door-destruction / block-other-explosions / block-windcharge-explosions,
 #   player-damage.teleport-on-void-falling / reset-fall-on-void-teleport / teleport-on-suffocation /
-#   disable-death-messages, simulation.sponge.*, chest-protection.*, and the blacklist
+#   disable-death-messages, default.pumpkin-scuba, simulation.sponge.*, chest-protection.*, and the blacklist
 #   (`blacklist.use-as-whitelist`, `blacklist.logging.console.enable`; the rules are in each world's
 #   `blacklist.txt`).
+# Of the engine branch fam-worldguard-gameplay-cancels: gameplay.block-potions (a list of
+# effect names), gameplay.block-potions-overly-reliably, gameplay.disable-conduit-effects, mobs.anti-wolf-dumbness,
+# protection.remove-infinite-stacks. protection.item-durability (default true) is read but needs an engine hook.
 # A world's own `<data-folder>/worlds/<world>/config.yml` (WorldGuard's layout) overrides these for
 # that world.
 # All default to false, except mobs.allow-tamed-spawns, mobs.block-plugin-spawning,
@@ -128,7 +143,8 @@ const RULE_SECTIONS: [&str; 17] = [
 ];
 
 /// Rule keys that are true unless the file says otherwise.
-const RULE_DEFAULT_TRUE: [&str; 5] = [
+const RULE_DEFAULT_TRUE: [&str; 6] = [
+    "protection.item-durability",
     "blacklist.logging.console.enable",
     "mobs.allow-tamed-spawns",
     "mobs.block-plugin-spawning",
@@ -143,6 +159,7 @@ pub struct WorldRules {
     pub rules: BTreeMap<String, bool>,
     pub lists: BTreeMap<String, Vec<String>>,
     pub ints: BTreeMap<String, i64>,
+    pub strings: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -167,6 +184,15 @@ pub struct Config {
     pub use_player_teleports: bool,
     pub use_creature_spawn_event: bool,
     pub invincibility_removes_mobs: bool,
+    /// `auto-invincible` (`auto-invincible-permission`): `worldguard.auto-invincible` starts god mode.
+    pub auto_invincible: bool,
+    /// `auto-invincible-group`: the group `wg-invincible` starts god mode.
+    pub auto_invincible_group: bool,
+    /// `auto-no-drowning-group`: the group `wg-amphibious` does not drown.
+    pub auto_no_drowning_group: bool,
+    pub use_particle_effects: bool,
+    /// `regions.uuid-migration.perform-on-next-start`.
+    pub migrate_regions_to_uuid: bool,
     pub cancel_empty_chat: bool,
     pub titles_default_times: bool,
     pub use_max_priority_association: bool,
@@ -187,6 +213,8 @@ pub struct Config {
     pub lists: BTreeMap<String, Vec<String>>,
     /// `section.key` -> number (`simulation.sponge.radius`).
     pub ints: BTreeMap<String, i64>,
+    /// `section.key` -> text (`blacklist.logging.file.path`, ...).
+    pub strings: BTreeMap<String, String>,
     /// World folder name -> that world's own options.
     pub world_rules: BTreeMap<String, WorldRules>,
 }
@@ -233,6 +261,16 @@ impl Config {
             .unwrap_or(default)
     }
 
+    /// A text option for the world folder `world` (`blacklist.logging.file.path`), or `default`.
+    pub fn text_in<'a>(&'a self, world: &str, key: &str, default: &'a str) -> &'a str {
+        self.world_rules
+            .get(world)
+            .and_then(|w| w.strings.get(key))
+            .or_else(|| self.strings.get(key))
+            .map(String::as_str)
+            .unwrap_or(default)
+    }
+
     /// Reads a world's own `config.yml` (WorldGuard's layout: the same sections as the common
     /// file). Every boolean, number and list of text below any key is kept under its dotted
     /// path; a text that is not valid YAML leaves the old options in place.
@@ -251,6 +289,9 @@ impl Config {
                 }
                 Value::Int(n) => {
                     out.ints.insert(prefix.to_owned(), *n);
+                }
+                Value::Str(t) => {
+                    out.strings.insert(prefix.to_owned(), t.clone());
                 }
                 Value::List(items) => {
                     let list = items.iter().filter_map(Value::to_text).map(|t| t.to_ascii_lowercase()).collect();
@@ -327,17 +368,19 @@ impl Config {
         let mut rules = BTreeMap::new();
         let mut lists = BTreeMap::new();
         let mut ints = BTreeMap::new();
+        let mut strings = BTreeMap::new();
         fn collect(
             prefix: &str,
             v: &toml::Value,
             rules: &mut BTreeMap<String, bool>,
             lists: &mut BTreeMap<String, Vec<String>>,
             ints: &mut BTreeMap<String, i64>,
+            strings: &mut BTreeMap<String, String>,
         ) {
             match v {
                 toml::Value::Table(tab) => {
                     for (k, v) in tab {
-                        collect(&format!("{prefix}.{k}"), v, rules, lists, ints);
+                        collect(&format!("{prefix}.{k}"), v, rules, lists, ints, strings);
                     }
                 }
                 toml::Value::Boolean(b) => {
@@ -345,6 +388,9 @@ impl Config {
                 }
                 toml::Value::Integer(n) => {
                     ints.insert(prefix.to_owned(), *n);
+                }
+                toml::Value::String(t) => {
+                    strings.insert(prefix.to_owned(), t.clone());
                 }
                 toml::Value::Array(a) => {
                     let list = a.iter().filter_map(|x| x.as_str().map(str::to_ascii_lowercase)).collect();
@@ -355,7 +401,7 @@ impl Config {
         }
         for section in RULE_SECTIONS {
             if let Some(v) = t.get(section) {
-                collect(section, v, &mut rules, &mut lists, &mut ints);
+                collect(section, v, &mut rules, &mut lists, &mut ints, &mut strings);
             }
         }
         let cfg = Config {
@@ -385,6 +431,11 @@ impl Config {
             use_player_teleports: regions_or_top("use-player-teleports", true),
             use_creature_spawn_event: boolean(regions, "use-creature-spawn-event", true),
             invincibility_removes_mobs: boolean(regions, "invincibility-removes-mobs", false),
+            auto_invincible: boolean(&t, "auto-invincible", boolean(&t, "auto-invincible-permission", false)),
+            auto_invincible_group: boolean(&t, "auto-invincible-group", false),
+            auto_no_drowning_group: boolean(&t, "auto-no-drowning-group", false),
+            use_particle_effects: boolean(&t, "use-particle-effects", true),
+            migrate_regions_to_uuid: boolean(&t, "uuid-migration-on-start", true),
             cancel_empty_chat: boolean(regions, "cancel-chat-without-recipients", true),
             titles_default_times: boolean(regions, "titles-always-use-default-times", true),
             use_max_priority_association: boolean(protection, "use-max-priority-association", false),
@@ -417,6 +468,7 @@ impl Config {
             rules,
             lists,
             ints,
+            strings,
             world_rules: BTreeMap::new(),
         };
         Ok(cfg)
@@ -445,6 +497,32 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_options_come_from_common_and_world_files() {
+        let mut c = Config::parse("[blacklist.logging.file]\npath = \"a/%Y.log\"\n").unwrap();
+        assert_eq!(c.text_in("world", "blacklist.logging.file.path", "d"), "a/%Y.log");
+        assert_eq!(c.text_in("world", "blacklist.logging.file.other", "d"), "d");
+        c.set_world_yaml("world", "blacklist:\n    logging:\n        file:\n            path: b/%m.log\n").unwrap();
+        assert_eq!(c.text_in("world", "blacklist.logging.file.path", "d"), "b/%m.log");
+        assert_eq!(c.text_in("nether", "blacklist.logging.file.path", "d"), "a/%Y.log");
+    }
+
+    #[test]
+    fn auto_god_keys_and_the_durability_default() {
+        let c = Config::default();
+        assert!(!c.auto_invincible && !c.auto_invincible_group && !c.auto_no_drowning_group);
+        assert!(c.use_particle_effects && c.migrate_regions_to_uuid);
+        assert!(c.rule("protection.item-durability"));
+        let c = Config::parse(
+            "auto-invincible-permission = true\nauto-invincible-group = true\nauto-no-drowning-group = true\n[protection]\nitem-durability = false\n[gameplay]\nblock-potions = [\"Poison\"]\ndisable-conduit-effects = true\n",
+        )
+        .unwrap();
+        assert!(c.auto_invincible && c.auto_invincible_group && c.auto_no_drowning_group);
+        assert!(!c.rule("protection.item-durability"));
+        assert!(c.rule("gameplay.disable-conduit-effects"));
+        assert_eq!(c.lists["gameplay.block-potions"], vec!["poison".to_owned()]);
+    }
 
     #[test]
     fn defaults_match_the_servers() {

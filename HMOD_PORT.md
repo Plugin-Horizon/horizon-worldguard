@@ -77,7 +77,7 @@ Checklist round 100
 [ ] `/wg running` lists tasks: the port runs no async tasks, so it always says none
 [ ] `/rg migratedb` only the file store; `migrateuuid` is a stub (no SQL, no UUID migration)
 [ ] blacklist `on-equip`, `on-dispense`, `ignore-groups`, database log (API gaps, GAPS_UPSTREAM)
-[ ] blacklist `path` and `open-files` text options (config keeps no text values)
+[n/a java-only] blacklist `open-files` (cache of open file handles; port appends per line, same file content); `path` is done
 [ ] per-world `config.yml` text values (`path`, `dsn`-type options), only booleans, numbers and lists are kept
 [ ] `physics.*`, `mobs.block-zombie-door-destruction`, `enderman` portal, `anti-wolf-dumbness`, growth flags (API gaps)
 [ ] death messages, pumpkin scuba, conduit effects, item durability, infinite stacks, potion blocking (API gaps)
@@ -85,3 +85,14 @@ Checklist round 100
 [ ] `weather-lock`, `time-lock` (per-player weather and time, API gap)
 [ ] `iconomy.*`, `summary-on-start`, `custom-metrics-charts`, `regions.use-paper-entity-origin`, `event-handling.*`: not applicable
 Open items are API-blocked or need a config text store; the checklist is not finished, so this is not 100 %.
+
+Round 5 (round 2 against the combined next SDK, 2026-11-25; written blind, not built)
+- Added: `weather-lock`, `time-lock` (`worldguard_core/session.rs`, `apply_lock` in `lib.rs`: `game_event` 1/2/7/8 and `set_time` through `player_send_packet`, resent every tick while a time lock holds); `vine-growth`, `sculk-growth` (`natural_block_spread`, `block_grow`); `potion-splash` splash (`potion_splash_cancel`); `mobs.block-zombie-door-destruction` (`entity_break_door_cancel`); `disable-death-messages` (`player_death_message`); blacklist `on-dispense` (`block_dispense`) and `ignore-groups` (`permission_groups`); `/halt-activity` entity removal (`sweep_intensive`, `levels().list_levels()`, `level.all_entities`, `entity.discard`); `/rg migrateuuid`; late region nodes without the feature gate; `hanging_break` reads the event's dimension.
+- Gaps left (all in audit `ENGINE_NEEDS.md`): block_physics_cancel, cancellable_mob_event_hooks (portal_create cancel, host in the damage hook), block_growth_spread_hooks (grass, mycelium, rock), blacklist_equip_dispense_hooks (equip only), living_heal_cause_cancel, compass_target, profiler.
+- Round 5b: behind `next-engine` (off by default): `block_physics_cancel`, `block_growth_cancel`, `living_heal_cause_cancel` (replaces the heal-of-1-or-less rule), `armor_equip_cancel` (blacklist `on-equip`), host weather and time, `/locate <player>`.
+
+Round 6 (completeness audit, 2026-11-25; written blind, first build pending)
+- Added from `audit/rec100/COMPLETENESS.md`: `worldguard.auto-invincible` (`auto-invincible`, `auto-invincible-group`, `auto-no-drowning-group`; read once a second for a new player, the permission provider may not know them at login), `worldguard.god.override-regions` and `Guard::invincible` (god mode, the flag, a deny wins; `resolve_invincibility`), `worldguard.override.potions` and `worldguard.debug.pastebin` declared, `/wg debug testbreak|testplace|testinteract|testdamage` (`worldguard_core/debug.rs`: `-t`, `-s`, `look_direction`, `trace_blocks`, `report`).
+- Added from my own pass: invincible players are not hungry and are put out when burning, `invincibility-removes-mobs` (tamable kinds are spared), `use-particle-effects` (smoke through the `particle` command, `smoke_command`), `regions.uuid-migration` on start, `default.pumpkin-scuba` and amphibious mode (drowning cancelled, air refilled), portal use (`entity_travel_to_dimension`) and `/tp` (`teleport_command`, `movement::check_teleport`), `onVehicleExit` hold-back (`entity_mount` with `mounting = false`, `kinds::is_tameable`), `protection.item-durability` default true.
+- Round 8: the former `wave2` code is normal code (`mob_effect_apply_cancel`, `player_oversize_stack`, `living_incoming_damage_detail`, `/wg profile|stopprofile`, `/wg debug trace`), and TNT lit by an arrow is refused through `tnt_primed_detail`. Count 43 of 44 (before 37 of 43).
+- Gaps left (ENGINE_NEEDS): item_durability_cancel.

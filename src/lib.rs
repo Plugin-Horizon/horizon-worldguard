@@ -5,8 +5,9 @@
 
 pub mod worldguard_core;
 mod chest_world;
+mod cmdkit;
 use mod_api::{
-    TriState, ArmorStandManipulateEvent, AttackEntityEvent, BlockBurnEvent, BlockIgniteEvent,
+    ModServiceCallEvent, TriState, ArmorStandManipulateEvent, AttackEntityEvent, BlockBurnEvent, BlockIgniteEvent,
     BlockSpreadEvent, BreakBlockEvent, BucketEmptyEvent, CanPlayerSleepEvent, Command,
     CommandArgumentValue, CommandSource, Config, ConfigKind, ConfigLoadingEvent,
     ConfigReloadingEvent, EnderPearlTeleportEvent, EntityInteractEvent, EntityJoinLevelEvent,
@@ -21,7 +22,17 @@ use mod_api::{
     CropGrowPreEvent, EntityChangeBlockPreEvent, EntityMobGriefingEvent, ExplosionStartEvent,
     FluidPlaceBlockEvent, FoodLevelChangedEvent, Host, LivingExperienceDropEvent, LivingHealEvent, LoopContext,
     MoistureChangeEvent, BlockFadeEvent, BlockFormEvent, BlockGrowFeatureEvent, EntityStruckByLightningEvent, Hand,
-    SignChangedEvent, WeatherChangeEvent,
+    SignChangedEvent, WeatherChangeEvent, BlockDispenseEvent, BlockGrowEvent, EntityBreakDoorCancelEvent,
+    NaturalBlockSpreadEvent, PlayerDeathMessageEvent, PotionSplashCancelEvent,
+};
+use mod_api::{
+    ArmorEquipCancelEvent, BlockGrowthCancelEvent, BlockPhysicsCancelEvent, EntityTravelToDimensionEvent,
+    EquipmentSlot, LivingHealCauseCancelEvent, PortalCreateEntityCancelEvent, TeleportCommandEvent,
+};
+// The hooks of the engine branches fam-worldguard-gameplay-cancels and fam-diagnostics-profiler.
+use mod_api::{
+    TntPrimedDetailEvent, LivingIncomingDamageDetailEvent, MobEffectApplyCancelEvent, PlayerOversizeStackEvent, EventTraceRefusal,
+    ProfileHandle, ProfileLevel, ProfileRefusal, ProfileScope,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -98,6 +109,25 @@ struct State {
     teleported: HashSet<u128>,
     /// Players in `/god` mode (damage to them is cancelled).
     god: HashSet<u128>,
+    /// Players who have just joined: `auto-invincible` and the groups are read once a second until they are done.
+    pending_auto: HashSet<u128>,
+    /// Players who hold `worldguard.god.override-regions` (read once a second).
+    god_override: HashSet<u128>,
+    /// Players in amphibious mode (`auto-no-drowning-group`, group `wg-amphibious`): they do not drown.
+    amphibious: HashSet<u128>,
+    /// Players who wear a carved pumpkin or a jack o'lantern (read every half second): `default.pumpkin-scuba`.
+    pumpkin: HashSet<u128>,
+    /// Players whose air is refilled at the next tick (a drowning hit that was cancelled).
+    air_resets: Vec<u128>,
+    /// Mobs that hit an invincible player and are removed at the next tick (`invincibility-removes-mobs`).
+    kill_mobs: Vec<i32>,
+    /// Region owner and member names are moved to unique ids once, at the first tick (`uuid-migration-on-start`).
+    migrated: bool,
+    /// Players with `worldguard.override.potions` / `worldguard.override.infinite-stack` (read once a second).
+    potion_override: HashSet<u128>,
+    infinite_override: HashSet<u128>,
+    /// The session of `/wg profile` (the handle and who started it), when one runs.
+    profile: Option<(ProfileHandle, String, bool)>,
     /// `heal-*` / `feed-*` timers.
     vitals: Vitals,
     /// Players who hold `worldguard.region.bypass.<world>` for the world they are in (read once a second).
@@ -112,6 +142,8 @@ struct State {
     rescues: Vec<u128>,
     /// Sponges placed (dimension, position): the water around them is cleared at the next tick.
     sponge_clears: Vec<(String, [i32; 3])>,
+    /// Who is under a `weather-lock` or `time-lock`.
+    sessions: wg::session::Sessions,
 }
 
 impl Default for State {
@@ -132,6 +164,16 @@ impl Default for State {
             explosives: HashMap::new(),
             teleported: HashSet::new(),
             god: HashSet::new(),
+            pending_auto: HashSet::new(),
+            god_override: HashSet::new(),
+            amphibious: HashSet::new(),
+            pumpkin: HashSet::new(),
+            air_resets: Vec::new(),
+            kill_mobs: Vec::new(),
+            migrated: false,
+            potion_override: HashSet::new(),
+            infinite_override: HashSet::new(),
+            profile: None,
             vitals: Vitals::default(),
             bypass: HashSet::new(),
             blacklists: HashMap::new(),
@@ -139,6 +181,7 @@ impl Default for State {
             trail: HashMap::new(),
             rescues: Vec::new(),
             sponge_clears: Vec::new(),
+            sessions: wg::session::Sessions::default(),
         }
     }
 }
@@ -346,6 +389,29 @@ impl State {
     fn cached(&self, uuid: u128) -> Option<Player> {
         self.by_uuid.get(&uuid).map(|p| self.player(p))
     }
+
+    /// `playDenyEffect`: smoke at `at` for the player a break or place was refused to, when `use-particle-effects`
+    /// is on (the particle command at the next tick).
+    fn deny_smoke(&mut self, p: &Player, at: [f64; 3]) {
+        if self.guard.cfg.use_particle_effects {
+            self.commands.push(wg::debug::smoke_command(&p.dimension, &p.subject.name, at));
+        }
+    }
+}
+
+/// Finished pastes: who asked (None for the console) and the line to tell them.
+static PASTED: Mutex<Vec<(Option<u128>, String)>> = Mutex::new(Vec::new());
+
+/// Uploads `content` to the paste service on a thread and queues the answer for the next tick.
+fn spawn_paste(who: Option<u128>, content: String, extension: &'static str, label: &'static str) {
+    std::thread::spawn(move || {
+        let meta = wg::paste::Meta { name: None, author: None, extension: Some(extension) };
+        let line = match wg::paste::upload(wg::paste::SERVICE, &content, &meta) {
+            Ok(url) => format!("&d{label}{url}"),
+            Err(e) => format!("&cFailed to submit paste: {e}"),
+        };
+        PASTED.lock().unwrap_or_else(|e| e.into_inner()).push((who, line));
+    });
 }
 
 /// One player through the host, or None when they are not in a level.
@@ -489,6 +555,92 @@ fn host_block(host: &dyn ServerHost, dimension: &str, pos: [i32; 3]) -> String {
         .unwrap_or_default()
 }
 
+/// The `worldguard:region` answer for a region (see `mod_service_call`).
+fn region_reply(region: Option<&wg::region::Region>) -> String {
+    use wg::geom::Shape;
+    match region.map(|r| &r.shape) {
+        None => "none".to_owned(),
+        Some(Shape::Cuboid { min, max }) => format!("cuboid\t{}\t{}\t{}\t{}\t{}\t{}", min.x, min.y, min.z, max.x, max.y, max.z),
+        Some(Shape::Polygon { points, min_y, max_y }) => {
+            let pts: Vec<String> = points.iter().map(|p| format!("{},{}", p[0], p[1])).collect();
+            format!("polygon\t{min_y}\t{max_y}\t{}", pts.join(";"))
+        }
+        Some(Shape::Global) => "global".to_owned(),
+    }
+}
+
+/// The dimensions of the worlds that have a region file, for a hook that names none.
+fn region_dimensions(guard: &Guard) -> Vec<String> {
+    guard
+        .worlds
+        .keys()
+        .map(|w| guard.cfg.dimension_of(w).unwrap_or_else(|| format!("minecraft:{w}")))
+        .collect()
+}
+
+/// The dimension of a hook that names none: the acting player's, else None.
+fn acting_dimension(host: &dyn ServerHost) -> Option<String> {
+    host.players()
+        .acting_player()
+        .and_then(|p| p.level(host))
+        .map(|l| l.dimension_id().to_string())
+}
+
+/// `Entities.isIntensiveEntity`: items, primed TNT, experience orbs, falling blocks and every living thing that is not
+/// tamed, a player or an armor stand.
+fn is_intensive(host: &dyn ServerHost, entity: mod_api::EntityRef) -> bool {
+    let Some(kind) = entity.kind(host).map(|k| k.id(host).to_string()) else {
+        return false;
+    };
+    match kind.strip_prefix("minecraft:").unwrap_or(&kind) {
+        "item" | "tnt" | "experience_orb" | "falling_block" => true,
+        "player" | "armor_stand" => false,
+        _ => host
+            .living(entity)
+            .is_some_and(|l| l.is_tamed(host) != Some(true)),
+    }
+}
+
+/// Removes every intensive entity of every loaded level; the result is the count per level (by world name).
+fn sweep_intensive(host: &mut dyn ServerHost, cfg: &WgConfig) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+    for level in host.levels().list_levels() {
+        let world = cfg.world_of(&level.dimension_id().to_string());
+        let Some(entities) = level.all_entities(&*host) else { continue };
+        let mut removed = 0;
+        for e in entities {
+            if is_intensive(&*host, e) && e.discard(&mut *host) {
+                removed += 1;
+            }
+        }
+        out.push((world, removed));
+    }
+    out
+}
+
+/// One step of a `weather-lock` or `time-lock` for a player (see `worldguard_core::session`).
+fn apply_lock(host: &mut dyn ServerHost, uuid: u128, dimension: &str, action: wg::session::Action) {
+    use wg::session::Action;
+    {
+        let Some(player) = host.player(uuid) else { return };
+        match action {
+            Action::Weather(r, t) => {
+                player.set_weather(host, if r { 1.0 } else { 0.0 }, if t { 1.0 } else { 0.0 });
+            }
+            Action::ResetWeather => {
+                player.reset_weather(host);
+            }
+            Action::Time(t, rel) => {
+                player.set_time(host, t, rel);
+            }
+            Action::ResetTime => {
+                player.reset_time(host);
+            }
+        }
+        let _ = dimension;
+    }
+}
+
 /// The typed node for one `worldguard.*` name (a Boolean, as the commands ask it).
 fn perm_node(name: &str) -> PermissionNode {
     PermissionNode::new(name, PermissionValueType::Boolean)
@@ -496,7 +648,6 @@ fn perm_node(name: &str) -> PermissionNode {
 
 /// Declares a region-scoped `worldguard.region.*` node after the server started, once per node (the host refuses a
 /// second declaration with `DuplicateNode`, which is ignored). Default: operator level, as the gather-time nodes.
-#[cfg(feature = "horizon_late_permission_nodes")]
 fn declare_region_node_once(host: &mut dyn ServerHost, node: &str) {
     static DECLARED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
     if !node.starts_with("worldguard.region.") {
@@ -512,27 +663,34 @@ impl Players for KnownPlayers<'_> {
     // The node's answer from the permission system (LuckPerms answers through the `player_permission_check` hook);
     // a node that no one declared is refused, and so is any error: a denial, never a grant.
     // `worldguard.region.<perm>.<id>` (and `.own.`/`.member.`, `addowner.unclaimed.<id>`) depend on the region id, so
-    // they cannot be declared at gather time. Without the late-declaration API they are refused here, which takes away
-    // the per-region grants of non-operators (HMOD-GAP(region-scoped-nodes)). With `horizon_late_permission_nodes` each
-    // such node is declared the first time it is asked. Operators still pass through `guard.is_admin` before these.
+    // they cannot be declared at gather time, so they are declared late.
+    // the per-region grants of non-operators. Each such node is declared the first time it is asked
+    // (`permission_declare_node`). Operators still pass through `guard.is_admin` before these.
     fn has_permission(&self, uuid: u128, node: &str) -> bool {
         let mut slot = self.host.borrow_mut();
         let host: &mut dyn ServerHost = &mut **slot;
-        #[cfg(feature = "horizon_late_permission_nodes")]
         declare_region_node_once(host, node);
         let Some(player) = host.player(uuid) else {
             return false;
         };
         player.permission_bool(host, &perm_node(node)).unwrap_or(false)
     }
+    // Names seen this session first, then the server's own profile lookup (user cache; never Mojang).
     fn resolve(&self, name: &str) -> Option<(u128, String)> {
-        self.names.get(&name.to_ascii_lowercase()).cloned()
+        self.names.get(&name.to_ascii_lowercase()).cloned().or_else(|| {
+            let slot = self.host.borrow();
+            slot.profile_by_name(name).map(|p| (p.uuid, p.name))
+        })
     }
     fn name_of(&self, uuid: u128) -> Option<String> {
         self.names
             .values()
             .find(|(u, _)| *u == uuid)
             .map(|(_, n)| n.clone())
+            .or_else(|| {
+                let slot = self.host.borrow();
+                slot.profile_by_uuid(uuid).map(|p| p.name)
+            })
     }
 }
 
@@ -633,18 +791,21 @@ impl Mod {
             return true;
         }
         let player = host.player(p.subject.uuid);
+        // `ignore-groups`: the groups the permission provider published for the player (none without a provider).
+        let player_groups = host.permission_groups(p.subject.uuid).groups;
         let event = wg::blacklist::Event {
             kind,
             player: Some(p.subject.name.clone()),
             target: target.to_owned(),
         };
         // `ignore-perms`: a node that nobody declared is refused, so only declared nodes can exempt.
-        let mut ignores = |_groups: &[String], perms: &[String]| {
-            player.is_some_and(|pl| {
-                perms
-                    .iter()
-                    .any(|n| pl.permission_bool(&mut *host, &perm_node(n.trim())).unwrap_or(false))
-            })
+        let mut ignores = |groups: &[String], perms: &[String]| {
+            groups.iter().any(|g| player_groups.iter().any(|pg| pg.eq_ignore_ascii_case(g.trim())))
+                || player.is_some_and(|pl| {
+                    perms
+                        .iter()
+                        .any(|n| pl.permission_bool(&mut *host, &perm_node(n.trim())).unwrap_or(false))
+                })
         };
         let verdict = bl.check(&event, false, silent, now_ms, &mut ignores);
         let log_console = guard.rule(&p.dimension, "blacklist.logging.console.enable");
@@ -659,8 +820,11 @@ impl Mod {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs());
+                let pattern = guard.cfg.text_in(&world, "blacklist.logging.file.path", wg::blacklist::LOG_FILE_PATTERN);
+                // Keep the file under the data folder: no absolute path, no `..`.
+                let pattern = if pattern.starts_with('/') || pattern.contains("..") { wg::blacklist::LOG_FILE_PATTERN } else { pattern };
                 for l in &verdict.log {
-                    if let Some(path) = wg::blacklist::log_file_path(wg::blacklist::LOG_FILE_PATTERN, &world, Some(&p.subject.name), now) {
+                    if let Some(path) = wg::blacklist::log_file_path(pattern, &world, Some(&p.subject.name), now) {
                         append_log_line(&dir.join(path), &wg::blacklist::log_file_line(&p.subject.name, l, now));
                     }
                 }
@@ -680,6 +844,34 @@ impl Mod {
         }
         if let Some(reason) = &verdict.ban {
             commands.push(format!("ban {} {reason}", p.subject.name));
+        }
+        verdict.allowed
+    }
+
+    /// The blacklist's `on-dispense` for a dispenser (no player): whether `target` may be dispensed in `dimension`.
+    fn dispense_allowed(&self, dimension: &str, target: &str) -> bool {
+        let mut st = lock(&self.st);
+        let world = st.guard.cfg.world_of(dimension);
+        let now_ms = st.ticks * 1000 / TPS;
+        let State { blacklists, guard, by_uuid, tells, .. } = &mut *st;
+        let Some(bl) = blacklists.get_mut(&world) else {
+            return true;
+        };
+        if !bl.has_target(target) {
+            return true;
+        }
+        let event = wg::blacklist::Event { kind: EventType::Dispense, player: None, target: target.to_owned() };
+        let verdict = bl.check(&event, false, false, now_ms, &mut |_, _| false);
+        if guard.rule(dimension, "blacklist.logging.console.enable") {
+            for l in &verdict.log {
+                eprintln!("[worldguard] {l}");
+            }
+        }
+        for n in &verdict.notify {
+            eprintln!("[worldguard] {n}");
+            for s in by_uuid.values().filter(|s| s.permission >= guard.cfg.op_level) {
+                tells.push((s.uuid, format!("&7{n}")));
+            }
         }
         verdict.allowed
     }
@@ -759,7 +951,7 @@ impl Mod {
     }
 
     /// `/wg reload | flushstates [player] | running | version`.
-    fn wg_command(&self, host: &mut dyn ServerHost, args: &str) -> Vec<String> {
+    fn wg_command(&self, host: &mut dyn ServerHost, sender: Option<&Snap>, args: &str) -> Vec<String> {
         let mut st = lock(&self.st);
         st.load_all(&*host);
         let args = args.trim();
@@ -786,12 +978,12 @@ impl Mod {
                             st.tracker.forget(uuid);
                             vec![format!("&dCleared states for player \"{arg}\".")]
                         }
-                        None => vec![format!("&cNo players matched query '{arg}'.")],
+                        None => vec![NO_PLAYERS.to_owned()],
                     }
                 }
             }
             "running" | "queue" => vec!["&dThere are currently no running tasks.".into()],
-            "" | "version" => vec![
+            "version" => vec![
                 // The Java plugin's version (gradle.properties of the WorldGuard source this port follows).
                 "&dWorldGuard 7.0.22-SNAPSHOT".to_owned(),
                 "&dhttp://www.enginehub.org".to_owned(),
@@ -799,8 +991,12 @@ impl Mod {
                 "&7* Horizon".to_owned(),
             ],
             "report" => {
-                if arg.split_whitespace().any(|a| a == "-p") {
-                    return vec!["&cThe report cannot be uploaded: there is no paste service.".into()];
+                let paste = arg.split_whitespace().any(|a| a == "-p");
+                if paste
+                    && let Some(s) = sender
+                    && !may(&mut *host, s.uuid, "worldguard.report.pastebin", st.guard.cfg.op_level)
+                {
+                    return vec![NO_PERMISSION.to_owned()];
                 }
                 let Some(dir) = st.data_dir.clone() else {
                     return vec!["&cFailed to write report: no world is open.".into()];
@@ -816,7 +1012,15 @@ impl Mod {
                     }
                 }
                 let file = dir.join("report.txt");
+                let pasted = report.clone();
                 match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&file, report)) {
+                    Ok(()) if paste => {
+                        spawn_paste(sender.map(|s| s.uuid), pasted, "report", "WorldGuard report: ");
+                        vec![format!(
+                            "&dWorldGuard report written to {}/report.txt",
+                            st.guard.cfg.data_folder.trim_end_matches('/')
+                        )]
+                    }
                     Ok(()) => vec![format!(
                         "&dWorldGuard report written to {}/report.txt",
                         st.guard.cfg.data_folder.trim_end_matches('/')
@@ -824,20 +1028,318 @@ impl Mod {
                     Err(e) => vec![format!("&cFailed to write report: {e}")],
                 }
             }
-            // HMOD-GAP(profiler): Horizon gives a mod no thread sampler and no way to replay events.
-            "profile" | "stopprofile" | "debug" => {
-                vec![format!("&c/wg {sub} is not available on Horizon.")]
+            "debug" => {
+                drop(st);
+                self.debug_command(host, sender, arg)
             }
-            _ => vec![
-                "&cUnknown subcommand. Use /wg reload, flushstates, running, report, profile, stopprofile, debug or version.".into(),
-            ],
+            // The profiler of the engine branch fam-diagnostics-profiler.
+            "profile" => {
+                drop(st);
+                self.profile_command(host, sender, arg)
+            }
+            "stopprofile" => {
+                drop(st);
+                self.stop_profile_command(host)
+            }
+            _ => vec![format!("&c{WG_USAGE}")],
         }
     }
 
-    /// Nether portals (`player-portal` checks at the destination) are not ported: arismoko's
-    /// `entity_portal` hook gives no cause and no destination, so the check below is kept but
-    /// never called. TODO(arismoko-api: player_portal): cause and destination of a portal use.
-    #[allow(dead_code)]
+    /// `/wg debug testbreak|testplace|testinteract|testdamage <player> [-t] [-s]` (`DebuggingCommands`): asks WorldGuard
+    /// whether the player could break, place, use or hit what the sender (or with `-t` the player) looks at, and
+    /// prints the report (`CancelReport`) in place of the other plugins' answers, which Horizon does not have.
+    fn debug_command(&self, host: &mut dyn ServerHost, sender: Option<&Snap>, arg: &str) -> Vec<String> {
+        let (sub, rest) = arg.split_once(' ').map_or((arg, ""), |(a, b)| (a, b.trim()));
+        let sub = sub.to_ascii_lowercase();
+        if sub == "trace" {
+            return self.trace_command(host, rest);
+        }
+        let what = match sub.as_str() {
+            "testbreak" => "BLOCK BREAK",
+            "testplace" => "BLOCK PLACE",
+            "testinteract" => "BLOCK INTERACT",
+            "testdamage" => "ENTITY DAMAGE",
+            "" => return vec!["&cUsage: /wg debug testbreak|testplace|testinteract|testdamage <player> [-t] [-s]".to_owned(), "&cUsage: /wg debug trace start <player> [limit] | take | stop".to_owned()],
+            _ => return vec![format!("&cUnknown subcommand: {sub}. Use testbreak, testplace, testinteract or testdamage.")],
+        };
+        let args = match wg::debug::parse_args(rest) {
+            Ok(a) => a,
+            Err(e) => return vec![format!("&c{e}"), format!("&cUsage: /wg debug {sub} <player> [-t] [-s]")],
+        };
+        let target = match self.match_targets(&args.target) {
+            Ok(mut t) if t.len() == 1 => t.remove(0),
+            Ok(_) => return vec!["&cMore than one player found! Use the exact name or '*'.".to_owned()],
+            Err(e) => return vec![e],
+        };
+        let (target_snap, target_player) = {
+            let st = lock(&self.st);
+            let Some(t) = st.by_uuid.get(&target.0).cloned() else { return vec!["&cThe player is not online.".to_owned()] };
+            let p = st.player(&t);
+            (t, p)
+        };
+        let source = if args.from_target {
+            target_snap.clone()
+        } else {
+            match sender {
+                Some(s) => s.clone(),
+                None => return vec!["&cIf this command is not to be used in-game, use -t to run the test from the viewpoint of the given player rather than yourself.".to_owned()],
+            }
+        };
+        if sender.is_none_or(|s| s.uuid != target.0) {
+            if let Some(s) = sender {
+                eprintln!("[worldguard] {} is simulating an event on {}", s.name, target.1);
+            }
+            tell(host, target.0, "&c(Please ignore any messages that may immediately follow.)");
+        }
+        let eye = [source.position[0], source.position[1] + 1.62, source.position[2]];
+        let dir = wg::debug::look_direction(source.yaw, source.pitch);
+        let mut out: Vec<String> = Vec::new();
+        let outcome: wg::guard::Outcome;
+        if sub == "testdamage" {
+            let end = [eye[0] + dir[0] * 20.0, eye[1] + dir[1] * 20.0, eye[2] + dir[2] * 20.0];
+            let hits = host
+                .level(&source.dimension)
+                .and_then(|l| l.ray_trace_entities(&*host, eye, end, 0.3, Some(target_snap.player.entity())))
+                .unwrap_or_default();
+            let Some(hit) = hits.into_iter().find(|h| h.entity.id() as i32 != source.entity_id) else {
+                return vec!["&cNot currently looking at an entity that is close enough.".to_owned()];
+            };
+            let kind = hit.entity.kind(&*host).map(|k| k.id(&*host)).unwrap_or_default();
+            let victim = {
+                let st = lock(&self.st);
+                st.by_entity.get(&(hit.entity.id() as i32)).map(|v| st.player(v))
+            };
+            out.push(format!("&bTesting ENTITY DAMAGE at {kind}"));
+            let st = lock(&self.st);
+            outcome = st.guard.attack_entity(&target_player, &kind, hit.location, victim.as_ref());
+        } else {
+            let Some(at) = wg::debug::trace_blocks(eye, dir).into_iter().find(|b| {
+                let id = host_block(&*host, &source.dimension, *b);
+                !id.is_empty() && !id.ends_with("air")
+            }) else {
+                return vec!["&cNot currently looking at a block that is close enough.".to_owned()];
+            };
+            let block = host_block(&*host, &source.dimension, at);
+            out.push(format!("&bTesting {what} at {block} [{}, {}, {}]", at[0], at[1], at[2]));
+            let mut p = target_player.clone();
+            p.dimension = source.dimension.clone();
+            let st = lock(&self.st);
+            outcome = match sub.as_str() {
+                "testbreak" => st.guard.break_block(&p, bp(at)),
+                "testplace" => st.guard.place_block(&p, bp(at)),
+                _ => st.guard.use_block(&p, bp(at), &block),
+            };
+        }
+        let report = wg::debug::report(outcome.err().map(|d| d.what));
+        if args.stack_trace {
+            out.push("&7The report was printed to console.".to_owned());
+            eprintln!("[worldguard] Event report:\n{}", report.join("\n"));
+            let allowed = match sender {
+                Some(s) => {
+                    let op_level = lock(&self.st).guard.cfg.op_level;
+                    may(&mut *host, s.uuid, "worldguard.debug.pastebin", op_level)
+                }
+                None => true,
+            };
+            if allowed {
+                spawn_paste(sender.map(|s| s.uuid), report.join("\n"), "txt", "Event debugging report: ");
+            } else {
+                out.push(NO_PERMISSION.to_owned());
+            }
+        } else {
+            let long = report.iter().map(String::len).sum::<usize>() >= 500;
+            out.extend(report.iter().map(|l| format!("&b{l}")));
+            if long && sender.is_some() {
+                out.push("&7The report was also printed to console.".to_owned());
+                eprintln!("[worldguard] Event report:\n{}", report.join("\n"));
+            }
+        }
+        out
+    }
+
+    /// `/wg profile [-p] [-i <interval>] [-t <filter>] [-c] [<minutes>]` on the engine's profiler session
+    /// (`profiler_start`): it records what each mod hook, tick step, mob type and block entity type took, for 1 to
+    /// 10 minutes, and ends by itself. `-t` keeps the rows whose name contains the text (WorldGuard's thread filter),
+    /// `-c` adds the block entities per chunk, `-i` is checked and ignored (the engine times every tick).
+    fn profile_command(&self, host: &mut dyn ServerHost, sender: Option<&Snap>, arg: &str) -> Vec<String> {
+        let (mut pastebin, mut chunks) = (false, false);
+        let (mut filter, mut interval, mut minutes): (Option<String>, Option<i64>, Option<i64>) = (None, None, None);
+        let mut words = arg.split_whitespace();
+        while let Some(w) = words.next() {
+            match w {
+                "-p" => pastebin = true,
+                "-c" => chunks = true,
+                "-t" => match words.next() {
+                    Some(v) => filter = Some(v.to_owned()).filter(|v| v != "*"),
+                    None => return vec!["&cA value is expected after the flag t.".to_owned()],
+                },
+                "-i" => match words.next().and_then(|v| v.parse::<i64>().ok()) {
+                    Some(v) => interval = Some(v),
+                    None => return vec!["&cA number is expected after the flag i.".to_owned()],
+                },
+                n => match n.parse::<i64>() {
+                    Ok(v) => minutes = Some(v),
+                    Err(_) => return vec![format!("&cNumber expected; string \"{n}\" given.")],
+                },
+            }
+        }
+        if pastebin {
+            let op_level = lock(&self.st).guard.cfg.op_level;
+            if let Some(s) = sender
+                && !may(&mut *host, s.uuid, "worldguard.report.pastebin", op_level)
+            {
+                return vec![NO_PERMISSION.to_owned()];
+            }
+        }
+        let ticks = match wg::debug::profile_ticks(minutes) {
+            Ok(t) => t,
+            Err(e) => return vec![format!("&c{e}")],
+        };
+        if let Some(i) = interval
+            && !(1..=100).contains(&i)
+        {
+            return vec!["&cInterval must be between 1 and 100 (in milliseconds)".to_owned()];
+        }
+        let level = if chunks { ProfileLevel::Chunks } else { ProfileLevel::Basic };
+        match host.profiler_start(ProfileScope::new(level, ticks, filter)) {
+            Ok(handle) => {
+                lock(&self.st).profile = Some((handle, sender.map(|s| s.name.clone()).unwrap_or_default(), pastebin));
+                let out = vec![
+                    format!("&dStarting profiling. Results will be available in {} minutes.", ticks / 1200),
+                    "&7Use &b/wg stopprofile&7 at any time to cancel profiling.".to_owned(),
+                ];
+                out
+            }
+            Err(ProfileRefusal::Running) => vec![
+                "&cA profile is currently in progress! Please use /wg stopprofile to cancel the current profile.".to_owned(),
+            ],
+            Err(ProfileRefusal::ModProfilerBusy) => {
+                vec!["&cThe mod profiler (/modprofile) or an event trace is running; stop it first.".to_owned()]
+            }
+            Err(_) => vec!["&cProfiling cannot be started on this server.".to_owned()],
+        }
+    }
+
+    fn stop_profile_command(&self, host: &mut dyn ServerHost) -> Vec<String> {
+        let Some((handle, _, _)) = lock(&self.st).profile.take() else {
+            return vec!["&cNo profile is currently running.".to_owned()];
+        };
+        let _ = host.profiler_stop(handle);
+        vec!["&dThe running profile has been cancelled.".to_owned()]
+    }
+
+    /// Once a second: a finished session is written to `profile.txt` and its starter is told.
+    fn finish_profile(&self, host: &mut dyn ServerHost) {
+        use wg::debug::Row;
+        let Some((handle, who, pastebin)) = lock(&self.st).profile.clone() else { return };
+        let Some(report) = host.profiler_report(handle) else {
+            lock(&self.st).profile = None;
+            return;
+        };
+        if report.running {
+            return;
+        }
+        let rows = |v: &[mod_api::ProfileCost]| -> Vec<Row> {
+            v.iter().map(|c| Row { name: c.name.clone(), calls: c.calls, nanos: c.nanos }).collect()
+        };
+        let sections = [
+            (
+                "Mod hooks",
+                report
+                    .mods
+                    .iter()
+                    .map(|m| Row { name: format!("{} {}", m.mod_id, m.hook), calls: m.calls, nanos: m.nanos })
+                    .collect::<Vec<_>>(),
+            ),
+            ("Tick steps", rows(&report.systems)),
+            ("Mob types", rows(&report.entity_types)),
+            ("Block entity types", rows(&report.block_entity_types)),
+            (
+                "Chunks (block entities)",
+                report
+                    .chunks
+                    .iter()
+                    .map(|c| Row {
+                        name: format!("{} [{}, {}]", c.dimension, c.chunk[0], c.chunk[1]),
+                        calls: c.calls,
+                        nanos: c.nanos,
+                    })
+                    .collect(),
+            ),
+        ];
+        let text = wg::debug::profile_text(report.ticks, report.mod_calls_dropped, &sections);
+        if pastebin {
+            let uuid = lock(&self.st).names.get(&who.to_ascii_lowercase()).map(|n| n.0);
+            spawn_paste(uuid, text.clone(), "profile", "Profile result: ");
+        }
+        let mut st = lock(&self.st);
+        st.profile = None;
+        let msg = match st.data_dir.clone() {
+            Some(dir) => match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(dir.join("profile.txt"), text)) {
+                Ok(()) => format!("&dProfiling data written to {}/profile.txt", st.guard.cfg.data_folder.trim_end_matches('/')),
+                Err(e) => format!("&cFailed to write profiling data: {e}"),
+            },
+            None => "&cFailed to write profiling data: no world is open.".to_owned(),
+        };
+        if let Some((uuid, _)) = st.names.get(&who.to_ascii_lowercase()).cloned() {
+            st.tells.push((uuid, msg));
+        } else {
+            eprintln!("[worldguard] {}", wg::text::plain(&msg));
+        }
+    }
+
+    /// `/wg debug trace start <player> [limit] | take | stop`: which mod listener ran in a player's turns and what it
+    /// cost (`event_trace_*`), the closest Horizon has to replaying an event for a player.
+    fn trace_command(&self, host: &mut dyn ServerHost, rest: &str) -> Vec<String> {
+        let mut w = rest.split_whitespace();
+        match w.next().unwrap_or("") {
+            "start" => {
+                let Some(name) = w.next() else { return vec!["&cUsage: /wg debug trace start <player> [limit]".to_owned()] };
+                let limit = w.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(1024).clamp(1, 4096);
+                let player = if name == "*" {
+                    None
+                } else {
+                    match self.match_targets(name) {
+                        Ok(mut t) if t.len() == 1 => Some(t.remove(0).0),
+                        Ok(_) => return vec!["&cMore than one player found! Use the exact name or '*'.".to_owned()],
+                        Err(e) => return vec![e],
+                    }
+                };
+                match host.event_trace_start(player, limit) {
+                    Ok(()) => vec![format!("&dTracing up to {limit} listener calls. Use /wg debug trace take to read them.")],
+                    Err(EventTraceRefusal::ModProfilerBusy) => {
+                        vec!["&cA profile session or /modprofile is running; stop it first.".to_owned()]
+                    }
+                    Err(_) => vec!["&cThe event trace cannot be started on this server.".to_owned()],
+                }
+            }
+            "take" => {
+                let entries = host.event_trace_take();
+                if entries.is_empty() {
+                    return vec!["&7No listener calls were recorded.".to_owned()];
+                }
+                let mut sums: std::collections::BTreeMap<(String, String), (u64, u64)> = Default::default();
+                for e in &entries {
+                    let s = sums.entry((e.mod_id.clone(), e.hook_name.clone())).or_default();
+                    s.0 += 1;
+                    s.1 += e.nanos;
+                }
+                let mut rows: Vec<_> = sums.into_iter().collect();
+                rows.sort_by(|a, b| b.1.1.cmp(&a.1.1));
+                let mut out = vec![format!("&d{} listener calls:", entries.len())];
+                out.extend(rows.into_iter().take(20).map(|((m, h), (n, ns))| {
+                    format!("&b{m} &7{h}: {n} calls, {:.3} ms", ns as f64 / 1e6)
+                }));
+                out
+            }
+            "stop" => vec![if host.event_trace_stop() { "&dEvent trace stopped." } else { "&cNo event trace is running." }.to_owned()],
+            _ => vec!["&cUsage: /wg debug trace start <player> [limit] | take | stop".to_owned()],
+        }
+    }
+
+    /// A nether portal use (`regions.nether-portal-protection`, `WorldGuardPlayerListener.onPlayerPortal`): the
+    /// block where the player would come out must be one they may build in. `entity_travel_to_dimension` names the
+    /// cause and the destination level; the arrival spot is worked out as the portal rules do, by the 8:1 scale.
     fn player_portal_check(
         &self,
         st: &State,
@@ -880,7 +1382,9 @@ impl Mod {
             "god" | "ungod" | "heal" | "slay" => self.general_command(host, root, sender, args),
             "stopfire" | "allowfire" => self.fire_command(host, root, sender, args),
             "halt-activity" | "stoplag" | "haltactivity" => self.halt_command(host, root, sender, args),
+            "stack" if !args.trim().is_empty() => vec!["&cToo many arguments.".to_owned(), "&c/stack".to_owned()],
             "stack" => self.stack_command(host, sender),
+            "locate" => self.locate_command(host, sender, args),
             _ => {
                 if let Some(s) = sender {
                     if let Some(node) = wg_node(args) {
@@ -890,7 +1394,7 @@ impl Mod {
                         }
                     }
                 }
-                self.wg_command(host, args)
+                self.wg_command(host, sender, args)
             }
         }
     }
@@ -901,7 +1405,7 @@ impl Mod {
         let st = lock(&self.st);
         if query == "*" {
             let all: Vec<(u128, String)> = st.by_uuid.values().map(|p| (p.uuid, p.name.clone())).collect();
-            return if all.is_empty() { Err("&cNo players matched query.".to_owned()) } else { Ok(all) };
+            return if all.is_empty() { Err(NO_PLAYERS.to_owned()) } else { Ok(all) };
         }
         let q = query.to_ascii_lowercase();
         let online: Vec<&Snap> = st.by_uuid.values().collect();
@@ -911,7 +1415,7 @@ impl Mod {
         let partial: Vec<&&Snap> = online.iter().filter(|p| p.name.to_ascii_lowercase().starts_with(&q)).collect();
         match partial.as_slice() {
             [p] => Ok(vec![(p.uuid, p.name.clone())]),
-            [] => Err(format!("&cNo players matched query '{query}'.")),
+            [] => Err(NO_PLAYERS.to_owned()),
             _ => Err("&cMore than one player found! Use the exact name or '*'.".to_owned()),
         }
     }
@@ -995,8 +1499,10 @@ impl Mod {
                     }
                 }
                 _ => {
-                    // The name comes from the players seen on this server, never from the typed text.
-                    lock(&self.st).commands.push(format!("kill {name}"));
+                    // `setHealth(0)`: the player dies of generic damage, at once, so the death message comes before "Slain!".
+                    if let Some(player) = host.player(uuid) {
+                        let _ = player.entity().hurt(&mut *host, "minecraft:generic", f32::MAX, None, None);
+                    }
                 }
             }
             if own {
@@ -1086,8 +1592,9 @@ impl Mod {
     }
 
     /// `/halt-activity [confirm]` (`/stoplag`, `/haltactivity`) with `-c` (lift), `-i` (status), `-s` (silent).
-    // HMOD-GAP(halt_entities): the entities that are already there are not removed (no way to list the
-    // loaded entities of a level); spawns, explosions, fire, leaf decay and fluid flow are stopped.
+    // The entities that are there are removed (`sweep_intensive`), and again every ten seconds while the halt
+    // lasts (WorldGuard does it on every chunk load and join); spawns, explosions, fire, leaf decay and fluid flow
+    // are stopped.
     fn halt_command(
         &self,
         host: &mut dyn ServerHost,
@@ -1129,10 +1636,7 @@ impl Mod {
         }
         let halt = !lift;
         if halt && !words.first().is_some_and(|w| w.eq_ignore_ascii_case("confirm")) {
-            return vec![
-                "&cThis command will &c&lPERMANENTLY&r&c erase ALL animals in ALL loaded chunks in ALL loaded worlds.".to_owned(),
-                format!("&aType &f/{root} confirm&c to confirm."),
-            ];
+            return vec![HALT_CONFIRM.to_owned()];
         }
         lock(&self.st).guard.activity_halted = halt;
         let name = sender.map_or("Console".to_owned(), |s| s.name.clone());
@@ -1146,6 +1650,12 @@ impl Mod {
             } else {
                 self.notify(host, &format!("&eALL intensive server activity halted by {name}."));
             }
+            let cfg = lock(&self.st).guard.cfg.clone();
+            for (world, removed) in sweep_intensive(&mut *host, &cfg) {
+                if removed > 10 {
+                    out.push(format!("{removed} entities (>10) auto-removed from {world}"));
+                }
+            }
         } else if silent {
             out.push("&d(Silent) ALL intensive server activity is now allowed.".to_owned());
         } else {
@@ -1155,6 +1665,42 @@ impl Mod {
             }
         }
         out
+    }
+
+    /// `/locate <player>`: points the sender's compass at the player (`GeneralCommands.locate`). Needs the compass call
+    /// of rec-player-misc; without it the command says so. `/locate` alone (the world spawn) needs a spawn read.
+    fn locate_command(&self, host: &mut dyn ServerHost, sender: Option<&Snap>, args: &str) -> Vec<String> {
+        let Some(s) = sender else { return vec!["&cA player is expected.".to_owned()] };
+        let op_level = lock(&self.st).guard.cfg.op_level;
+        if !may(&mut *host, s.uuid, "worldguard.locate", op_level) {
+            return vec![NO_PERMISSION.to_owned()];
+        }
+        let words: Vec<&str> = args.split_whitespace().collect();
+        if words.len() > 1 {
+            return vec!["&cToo many parameters.".to_owned(), "&cUsage: /locate [player]".to_owned()];
+        }
+        let Some(name) = words.first() else {
+            // No argument: the compass points at the spawn of the sender's world.
+            let spawn = host.player(s.uuid).and_then(|me| me.level(&*host)).and_then(|l| l.respawn_data(&*host));
+            let Some(spawn) = spawn else {
+                return vec!["&cThe world spawn cannot be read on this server.".to_owned()];
+            };
+            if let Some(me) = host.player(s.uuid) {
+                me.set_compass_target(host, spawn.pos);
+            }
+            return vec!["&dCompass repointed to the world spawn.".to_owned()];
+        };
+        let (uuid, _) = match self.match_targets(name) {
+            Ok(mut t) if t.len() == 1 => t.remove(0),
+            Ok(_) => return vec!["&cMore than one player found! Use the exact name or '*'.".to_owned()],
+            Err(e) => return vec![e],
+        };
+        let Some(target) = lock(&self.st).by_uuid.get(&uuid).cloned() else { return vec![] };
+        let at = [target.position[0].floor() as i32, target.position[1].floor() as i32, target.position[2].floor() as i32];
+        if let Some(me) = host.player(s.uuid) {
+            me.set_compass_target(host, at);
+        }
+        vec!["&dCompass repointed.".to_owned()]
     }
 
     /// `/stack`: merges the player's stacks of the same item (main inventory and hotbar).
@@ -1215,6 +1761,19 @@ fn append_log_line(path: &Path, line: &str) {
     }
 }
 
+/// What `/wg` and `/worldguard` print without a sub command, with `help` or an unknown one (always the long name).
+/// The vanilla command roots WorldGuard's commands replace.
+const OVERRIDDEN_ROOTS: &[&str] = &["locate"];
+
+const WG_USAGE: &str = "/worldguard <running|debug|reload|stopprofile|profile|flushstates|report|version>";
+
+/// `PlayerMatcher`: the reply when a name matches nobody (the query is not repeated).
+const NO_PLAYERS: &str = "&cNo players matched query.";
+
+/// The one chat line `/halt-activity` prints before it asks for `confirm` (the clickable part, then the typed command; the
+/// aliases `stoplag` and `haltactivity` show the same line).
+const HALT_CONFIRM: &str = "&cThis command will &c&lPERMANENTLY&r&c erase ALL animals in ALL loaded chunks in ALL loaded worlds. &a[Click]&c or type &f/halt-activity confirm&c to confirm.";
+
 const NO_PERMISSION: &str = "&cYou don't have permission to do that.";
 
 /// The node a `/wg` sub-command needs (`None`: open to everybody, the version).
@@ -1232,6 +1791,178 @@ fn wg_node(args: &str) -> Option<&'static str> {
     }
 }
 
+// --- the command tree ---------------------------------------------------------------------------------------------
+
+/// The roots that share another root's usages: `/rg` also answers to `/region` and `/regions`, `/wg` to `/worldguard`.
+fn aliases_of(root: &str) -> &'static [&'static str] {
+    match root {
+        "rg" => &["region", "regions"],
+        "wg" => &["worldguard"],
+        "halt-activity" => &["stoplag", "haltactivity"],
+        _ => &[],
+    }
+}
+
+/// One asking `<args:text>` argument per root, as Bukkit shows a command to the client: the aliases hang on the primary
+/// root only (a root of its own would make the alias "taken"), the rest of the line reaches `command_lines`.
+fn root_commands() -> Vec<Command> {
+    const PRIMARY: &[&str] = &["rg", "wg", "god", "ungod", "heal", "slay", "stopfire", "allowfire", "halt-activity", "stack", "locate"];
+    PRIMARY
+        .iter()
+        .map(|root| {
+            let mut command = Command::new(&cmdkit::ask(&format!("{root} [args:text]"), MOD_ID));
+            for alias in aliases_of(root) {
+                command = command.alias(alias);
+            }
+            command
+        })
+        .collect()
+}
+
+/// Every usage of WorldGuard's commands, root first: `/rg` (`commands::usages`), `/wg` and the general commands
+/// (`GeneralCommands`, `FlagCommands`, `WorldGuardCommands` of the original).
+fn tree_usages() -> &'static Vec<String> {
+    static USAGES: OnceLock<Vec<String>> = OnceLock::new();
+    USAGES.get_or_init(|| {
+        let mut out: Vec<String> = vec!["rg".to_owned()];
+        out.extend(commands::usages().into_iter().map(|u| format!("rg {u}")));
+        for u in [
+            "wg",
+            "wg version",
+            "wg reload",
+            "wg report",
+            "wg report -p",
+            "wg flushstates",
+            "wg flushstates <player:word>",
+            "wg running",
+            "wg profile [options:text]",
+            "wg stopprofile",
+            "wg debug [args:text]",
+            "god",
+            "god -s",
+            "god <player:word>",
+            "god -s <player:word>",
+            "ungod",
+            "ungod -s",
+            "ungod <player:word>",
+            "ungod -s <player:word>",
+            "heal",
+            "heal -s",
+            "heal <player:word>",
+            "heal -s <player:word>",
+            "slay",
+            "slay -s",
+            "slay <player:word>",
+            "slay -s <player:word>",
+            "stopfire [world:word]",
+            "allowfire [world:word]",
+            "halt-activity",
+            "halt-activity -c",
+            "halt-activity -i",
+            "halt-activity -s",
+            "halt-activity confirm",
+            "stack",
+            "locate [player:word]",
+        ] {
+            out.push(u.to_owned());
+        }
+        out
+    })
+}
+
+#[cfg(test)]
+mod tree_tests {
+    #[test]
+    fn locate_replaces_the_vanilla_command() {
+        assert_eq!(super::OVERRIDDEN_ROOTS, ["locate"]);
+        assert!(super::root_commands().iter().any(|c| c.usage().starts_with("locate")));
+    }
+
+    use super::*;
+
+    fn paths() -> Vec<String> {
+        cmdkit::literal_paths(tree_usages())
+    }
+
+    #[test]
+    fn the_region_commands_of_the_original_are_in_the_tree() {
+        let paths = paths();
+        for sub in [
+            "define", "redefine", "claim", "select", "info", "list", "flags", "flag", "setpriority", "setparent", "remove",
+            "addmember", "addowner", "removemember", "removeowner", "teleport", "load", "save", "migratedb", "migrateuuid",
+            "migrateheights",
+        ] {
+            assert!(paths.iter().any(|p| p == &format!("rg {sub}") || p.starts_with(&format!("rg {sub} "))), "rg {sub}");
+        }
+        assert!(paths.contains(&"rg flag pvp".to_owned()));
+        assert!(paths.contains(&"rg flag greeting".to_owned()));
+        assert!(paths.contains(&"rg list -p".to_owned()));
+    }
+
+    #[test]
+    fn the_general_and_wg_commands_of_the_original_are_in_the_tree() {
+        let paths = paths();
+        for want in [
+            "wg version", "wg reload", "wg report", "wg flushstates", "wg running", "wg profile", "god", "ungod", "heal", "slay",
+            "stopfire", "allowfire", "halt-activity", "stack", "locate",
+        ] {
+            assert!(paths.iter().any(|p| p == want || p.starts_with(&format!("{want} "))), "{want}");
+        }
+    }
+
+    #[test]
+    fn every_root_is_one_asking_argument_and_aliases_hang_on_the_primary_root() {
+        let commands = root_commands();
+        let usages: Vec<&str> = commands.iter().map(|c| c.usage.as_str()).collect();
+        assert!(usages.contains(&"rg [args:worldguard:text]"), "{usages:?}");
+        let rg = commands.iter().find(|c| c.usage.starts_with("rg ")).unwrap();
+        assert_eq!(rg.aliases, ["region", "regions"]);
+        // Every name the commands answer to is a root of the run hook, and no alias is also a root of its own.
+        let mut names: Vec<String> = Vec::new();
+        for c in &commands {
+            names.push(c.usage.split_whitespace().next().unwrap().to_owned());
+            names.extend(c.aliases.iter().cloned());
+        }
+        names.sort();
+        let mut want: Vec<String> = OUR_ROOTS.iter().map(|r| (*r).to_owned()).collect();
+        want.sort();
+        assert_eq!(names, want);
+    }
+
+    #[test]
+    fn the_replies_are_the_lines_paper_shows() {
+        assert_eq!(text::plain(&format!("{WG_USAGE}")), "/worldguard <running|debug|reload|stopprofile|profile|flushstates|report|version>");
+        assert_eq!(text::plain(NO_PLAYERS), "No players matched query.");
+        assert_eq!(
+            text::plain(HALT_CONFIRM),
+            "This command will PERMANENTLY erase ALL animals in ALL loaded chunks in ALL loaded worlds. [Click] or type /halt-activity confirm to confirm."
+        );
+    }
+
+    #[test]
+    fn paper_offers_only_the_online_names_at_every_word() {
+        let online = ["Notch".to_owned(), "alex".to_owned(), "Bob".to_owned()];
+        // Paper on `/rg `, `/god -s `, `/rg define ` and `/wg `: the names, nothing else.
+        for line in ["rg ", "god -s ", "rg define ", "wg ", "corewg-not-ours "] {
+            assert_eq!(paper_words(&online, line), ["alex", "Bob", "Notch"], "{line}");
+        }
+        assert_eq!(paper_words(&online, "rg addowner spawn no"), ["Notch"]);
+        assert!(paper_words(&online, "rg flag spawn pvp x").is_empty());
+    }
+
+    #[test]
+    fn every_usage_names_only_registered_kinds() {
+        for u in tree_usages() {
+            let asked = cmdkit::ask(u, MOD_ID);
+            assert!(!asked.contains(":player_name"), "{asked}");
+            for token in asked.split_whitespace().filter(|t| t.starts_with('<') || t.starts_with('[')) {
+                let kind = token.trim_matches(|c| "<>[]".contains(c)).split_once(':').unwrap().1;
+                assert!(["integer", "worldguard:word", "worldguard:text", "text"].contains(&kind), "{kind} in {asked}");
+            }
+        }
+    }
+}
+
 // --- slash forms ----------------------------------------------------------------------------------
 //
 // WorldGuard's commands (`/god`, `/rg`, `/wg`...) exist with ONE slash only; `//god` is not a command. The
@@ -1243,43 +1974,22 @@ static SLASH_AWARE: AtomicBool = AtomicBool::new(false);
 
 const OUR_ROOTS: &[&str] = &[
     "rg", "region", "regions", "wg", "worldguard", "god", "ungod", "heal", "slay", "stopfire", "allowfire",
-    "halt-activity", "stoplag", "haltactivity", "stack",
+    "halt-activity", "stoplag", "haltactivity", "stack", "locate",
 ];
 
 // --- completions ----------------------------------------------------------------------------------
 //
-// `/rg` and `/wg` are one `<args:text>` argument for the engine, so the words come from the `tab_complete` hook: the
-// sub-commands, the options, the flag names, the region ids of the player's world (or of `-w <world>`), the worlds,
-// the online players and the values of state flags (`allow`, `deny`).
+// The original has no completer of its own (`WorldGuardPlugin` registers no `TabCompleter`), so a player is offered what
+// Bukkit offers for any command without one: the names of the players online that begin with the word being typed, at
+// every position and for every WorldGuard command. No sub-commands, flags, worlds or region ids are suggested, so the
+// client is given one asking argument per root (`register_commands`) and no literal tree to complete from.
 
-/// `commands::usages()` split into words, built once. The first word is the sub-command.
-fn rg_usage_words() -> &'static Vec<Vec<String>> {
-    static WORDS: OnceLock<Vec<Vec<String>>> = OnceLock::new();
-    WORDS.get_or_init(|| commands::usages().iter().map(|u| u.split_whitespace().map(str::to_owned).collect()).collect())
-}
-
-/// A usage word `<name:kind>` or `[name:kind]`: its name and kind.
-fn usage_arg(word: &str) -> Option<(&str, &str)> {
-    word.strip_prefix('<')
-        .and_then(|w| w.strip_suffix('>'))
-        .or_else(|| word.strip_prefix('[').and_then(|w| w.strip_suffix(']')))?
-        .split_once(':')
-}
-
-fn starts_with_any_case(word: &str, prefix: &str) -> bool {
-    word.to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase())
-}
-
-/// Whether the player may use `/rg <sub>` at all: an operator, a `player-commands` entry, or a provider's grant of
-/// `worldguard.region.<sub>` (also its `.own` / `.member` forms, which apply to regions the player stands in).
-fn may_rg_sub(host: &mut dyn ServerHost, uuid: u128, op_level: u8, player_commands: &[String], sub: &str) -> bool {
-    let Some(p) = host.player(uuid) else { return false };
-    if p.permission_level(&*host).unwrap_or(0) >= op_level || player_commands.iter().any(|c| c == sub) {
-        return true;
-    }
-    ["", ".own", ".member"].iter().any(|tail| {
-        p.permission_bool(&mut *host, &perm_node(&format!("worldguard.region.{sub}{tail}"))).unwrap_or(false)
-    })
+/// The names (of `online`) that complete the last word of `command`, the line after the slash.
+fn paper_words(online: &[String], command: &str) -> Vec<String> {
+    let prefix = command.rsplit(' ').next().unwrap_or("").to_ascii_lowercase();
+    let mut names: Vec<String> = online.iter().filter(|n| n.to_ascii_lowercase().starts_with(&prefix)).cloned().collect();
+    names.sort_by_key(|n| n.to_ascii_lowercase());
+    names
 }
 
 impl Mod {
@@ -1292,139 +2002,60 @@ impl Mod {
             players.iter().map(|p| st.guard.cfg.world_of(&p.dimension)).collect()
         };
         let mut holders = HashSet::new();
+        let (mut overrides, mut potions, mut infinite) = (HashSet::new(), HashSet::new(), HashSet::new());
         for (np, world) in players.iter().zip(worlds) {
             let node = perm_node(&format!("worldguard.region.bypass.{world}"));
             if np.player.permission_bool(&mut *host, &node).unwrap_or(false) {
                 holders.insert(np.uuid);
             }
+            for (name, set) in [
+                ("worldguard.god.override-regions", &mut overrides),
+                ("worldguard.override.potions", &mut potions),
+                ("worldguard.override.infinite-stack", &mut infinite),
+            ] {
+                if np.player.permission_bool(&mut *host, &perm_node(name)).unwrap_or(false) {
+                    set.insert(np.uuid);
+                }
+            }
         }
-        lock(&self.st).bypass = holders;
-    }
-
-    /// The words that complete the last word of `rest` (what follows `/rg `).
-    fn complete_region(&self, host: &mut dyn ServerHost, uuid: u128, rest: &str) -> Vec<String> {
-        let tokens: Vec<&str> = rest.split(' ').collect();
-        let n = tokens.len() - 1;
-        let prefix = tokens[n];
-        let (op_level, player_commands, world_of_player) = {
+        // `PlayerModesListener.onProcessPlayer` for the players who joined since the last pass.
+        let pending: Vec<u128> = std::mem::take(&mut lock(&self.st).pending_auto).into_iter().collect();
+        let (by_permission, by_group, no_drown) = {
             let st = lock(&self.st);
-            let dimension = host
-                .player(uuid)
-                .and_then(|p| p.entity().level(&*host))
-                .map(|l| l.dimension_id().to_string())
-                .unwrap_or_else(|| OVERWORLD.to_owned());
-            (st.guard.cfg.op_level, st.guard.cfg.player_commands.clone(), st.guard.cfg.world_of(&dimension))
+            let c = &st.guard.cfg;
+            (c.auto_invincible, c.auto_invincible_group, c.auto_no_drowning_group)
         };
-        let mut out: Vec<String> = Vec::new();
-        let add = |out: &mut Vec<String>, word: &str| {
-            if starts_with_any_case(word, prefix) && !out.iter().any(|w| w == word) {
-                out.push(word.to_owned());
+        let mut gods: Vec<(u128, String, &'static str)> = Vec::new();
+        let mut amphibians: Vec<(u128, String)> = Vec::new();
+        // A player the host cannot read yet stays pending.
+        let unseen: Vec<u128> = pending.iter().copied().filter(|u| !players.iter().any(|np| np.uuid == *u)).collect();
+        for np in players.iter().filter(|np| pending.contains(&np.uuid)) {
+            let in_group = |host: &mut dyn ServerHost, group: &str| {
+                host.permission_groups(np.uuid).groups.iter().any(|g| g.eq_ignore_ascii_case(group))
+            };
+            if by_permission && np.player.permission_bool(&mut *host, &perm_node("worldguard.auto-invincible")).unwrap_or(false) {
+                gods.push((np.uuid, np.name.clone(), "permission"));
+            } else if by_group && in_group(&mut *host, "wg-invincible") {
+                gods.push((np.uuid, np.name.clone(), "group wg-invincible"));
             }
-        };
-        let usages = rg_usage_words();
-        if n == 0 {
-            for u in usages {
-                if may_rg_sub(host, uuid, op_level, &player_commands, &u[0]) {
-                    add(&mut out, &u[0]);
-                }
-            }
-            return out;
-        }
-        let Some(sub) = commands::canonical(tokens[0]) else { return out };
-        if !may_rg_sub(host, uuid, op_level, &player_commands, sub) {
-            return out;
-        }
-        // `-w <world>` typed before the cursor names the world the region ids come from.
-        let world = tokens[..n]
-            .windows(2)
-            .find(|w| w[0].eq_ignore_ascii_case("-w"))
-            .map(|w| w[1].to_owned())
-            .unwrap_or(world_of_player);
-        for usage in usages {
-            if usage[0] != sub {
-                continue;
-            }
-            for i in 1..=n {
-                let Some(word) = usage.get(i) else { break };
-                let arg = usage_arg(word);
-                if i < n {
-                    // A word typed before the cursor has to fit the usage's word at that place.
-                    let typed = tokens[i];
-                    let fits = match arg {
-                        None => typed.eq_ignore_ascii_case(word),
-                        Some((_, "integer")) => typed.parse::<i64>().is_ok(),
-                        Some(_) => true,
-                    };
-                    if !fits {
-                        break;
-                    }
-                    continue;
-                }
-                match arg {
-                    None => add(&mut out, word),
-                    Some((name, kind)) => match (name, kind) {
-                        ("id", _) | ("parent", _) => {
-                            let st = lock(&self.st);
-                            if let Some(w) = st.guard.worlds.get(&world) {
-                                for r in w.all() {
-                                    add(&mut out, &r.id);
-                                }
-                            }
-                            add(&mut out, "__global__");
-                        }
-                        ("world", _) => {
-                            let st = lock(&self.st);
-                            for w in st.guard.worlds.keys() {
-                                add(&mut out, w);
-                            }
-                        }
-                        ("group", _) => {
-                            for g in ["all", "members", "owners", "nonmembers", "nonowners", "none"] {
-                                add(&mut out, g);
-                            }
-                        }
-                        ("value", _) => {
-                            // `flag <id> <flag-name> [-g <group>] [value]`: the flag's own value words.
-                            let flag = usage.get(2).and_then(|f| wg::flags::FLAGS.iter().find(|d| d.name == f.as_str()));
-                            if let Some(def) = flag {
-                                let values: &[&str] = match def.kind {
-                                    wg::flags::Kind::State => &["allow", "deny"],
-                                    wg::flags::Kind::Bool => &["true", "false"],
-                                    wg::flags::Kind::GameMode => &["survival", "creative", "adventure", "spectator"],
-                                    _ => &[],
-                                };
-                                for v in values {
-                                    add(&mut out, v);
-                                }
-                            }
-                        }
-                        ("player", _) | ("others", _) | ("owners", _) | ("names", _) => {
-                            for p in host.players().server_players() {
-                                if let Some(name) = p.name(host) {
-                                    add(&mut out, &name);
-                                }
-                            }
-                        }
-                        _ => {}
-                    },
-                }
+            if no_drown && in_group(&mut *host, "wg-amphibious") {
+                amphibians.push((np.uuid, np.name.clone()));
             }
         }
-        out
-    }
-
-    /// The words that complete the last word of `rest` (what follows `/wg `).
-    fn complete_wg(&self, host: &mut dyn ServerHost, uuid: u128, rest: &str) -> Vec<String> {
-        if rest.contains(' ') {
-            return Vec::new();
+        let mut st = lock(&self.st);
+        st.bypass = holders;
+        st.god_override = overrides;
+        st.potion_override = potions;
+        st.infinite_override = infinite;
+        st.pending_auto.extend(unseen);
+        for (uuid, name, why) in gods {
+            st.god.insert(uuid);
+            eprintln!("[worldguard] Enabled auto-god mode for {name} ({why})");
         }
-        let op_level = lock(&self.st).guard.cfg.op_level;
-        ["version", "reload", "flushstates", "running", "report", "profile", "stopprofile", "debug"]
-            .iter()
-            .filter(|sub| wg_node(sub).is_none_or(|node| may(&mut *host, uuid, node, op_level)))
-            .filter(|sub| starts_with_any_case(sub, rest))
-            .map(|sub| (*sub).to_owned())
-            .collect()
+        for (uuid, name) in amphibians {
+            st.amphibious.insert(uuid);
+            eprintln!("[worldguard] Enabled water breathing mode for {name} (player is in group 'wg-amphibious')");
+        }
     }
 }
 
@@ -1467,11 +2098,17 @@ impl Hooks for Mod {
         }
         for n in [
             "stack",
+            "locate",
             "profile",
             "halt-activity",
             "fire-toggle.stop",
             "report.pastebin",
             "debug.event",
+            "debug.pastebin",
+            "auto-invincible",
+            "god.override-regions",
+            "override.potions",
+            "override.infinite-stack",
             "notify",
             "chest-protection.override",
             "override.chest-protection",
@@ -1518,27 +2155,16 @@ impl Hooks for Mod {
         lock(&self.st).save_dirty();
     }
 
+    fn register(&self, registrar: &mut dyn mod_api::Registrar, _: &mod_api::RegistrationContext) {
+        cmdkit::register(registrar);
+        // Bukkit-style: WorldGuard's `/locate [player]` replaces the vanilla command (Paper runs WG's).
+        for root in OVERRIDDEN_ROOTS {
+            registrar.override_vanilla_command(root);
+        }
+    }
+
     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
-        // One text argument per root: arismoko's dispatcher hands the typed line to
-        // `run_mod_command`, which runs the subcommand. `/rg` keeps level 0 (non-operators may run
-        // what `player-commands` lists; `run` checks the rest). `/wg` is level 2.
-        for root in ["rg", "region", "regions"] {
-            event.commands.push(Command::new(root));
-            event
-                .commands
-                .push(Command::new(&format!("{root} <args:text>")));
-        }
-        // `/wg` and the general commands are level 0 too: every path checks its node in
-        // `command_lines` (wg_node / general_command) before anything runs.
-        for root in [
-            "wg", "worldguard", "god", "ungod", "heal", "slay", "stopfire", "allowfire", "halt-activity", "stoplag",
-            "haltactivity", "stack",
-        ] {
-            event.commands.push(Command::new(root));
-            event
-                .commands
-                .push(Command::new(&format!("{root} <args:text>")));
-        }
+        event.commands.extend(root_commands());
     }
 
     fn run_mod_command(
@@ -1552,13 +2178,18 @@ impl Hooks for Mod {
         if !matches!(
             root.as_str(),
             "rg" | "region" | "regions" | "wg" | "worldguard" | "god" | "ungod" | "heal" | "slay" | "stopfire"
-                | "allowfire" | "halt-activity" | "stoplag" | "haltactivity" | "stack"
+                | "allowfire" | "halt-activity" | "stoplag" | "haltactivity" | "stack" | "locate"
         ) {
             return Flow::Continue;
         }
+        // The catch-all's text, or the words of the tree usage that matched, without the root.
         let args = match event.command.argument("args") {
             Some(CommandArgumentValue::String(s)) => s.clone(),
-            _ => String::new(),
+            _ if event.command.arguments.is_empty() && event.command.literals.len() == 1 => String::new(),
+            _ => {
+                let line = cmdkit::rebuild(tree_usages(), &event.command);
+                line.split_once(' ').map(|(_, rest)| rest.to_owned()).unwrap_or_default()
+            }
         };
         match *event.source {
             CommandSource::Player { player, .. } => {
@@ -1578,6 +2209,19 @@ impl Hooks for Mod {
         Flow::Cancel
     }
 
+    /// The service `worldguard:region` other mods call: payload `<world>\t<region id>`; the reply is `none`, or
+    /// `cuboid\t<minx>\t<miny>\t<minz>\t<maxx>\t<maxy>\t<maxz>`, `polygon\t<miny>\t<maxy>\t<x,z;x,z;...>` or `global`.
+    fn mod_service_call(&self, _: &mut dyn ServerHost, event: &mut ModServiceCallEvent<'_>) -> Option<mod_api::PayloadBytes> {
+        if event.service != "worldguard:region" {
+            return None;
+        }
+        let text = std::str::from_utf8(&event.payload.0).ok()?;
+        let (world, id) = text.split_once('\t')?;
+        let st = lock(&self.st);
+        let reply = region_reply(st.guard.worlds.get(world).and_then(|w| w.get(id.trim())));
+        Some(mod_api::PayloadBytes(reply.into_bytes()))
+    }
+
     fn server_tick(&self, host: &mut dyn ServerHost, event: &mut ServerTickEvent<'_>) {
         if !matches!(
             event.phase,
@@ -1591,6 +2235,7 @@ impl Hooks for Mod {
         // `worldguard.region.bypass.<world>`, asked once a second, before the lock is taken.
         if lock(&self.st).ticks % TPS == 0 {
             self.refresh_bypass(&mut *host);
+            self.finish_profile(&mut *host);
         }
         let mut st = lock(&self.st);
         st.load_all(&*host);
@@ -1605,10 +2250,17 @@ impl Hooks for Mod {
         let teleported = std::mem::take(&mut st.teleported);
         let online_count = players.len();
         let mut tells: Vec<(u128, String)> = std::mem::take(&mut st.tells);
+        for (who, line) in std::mem::take(&mut *PASTED.lock().unwrap_or_else(|e| e.into_inner())) {
+            match who {
+                Some(u) => tells.push((u, line)),
+                None => eprintln!("[worldguard] {}", text::plain(&line)),
+            }
+        }
         let mut titles: Vec<(u128, String, String)> = Vec::new();
         let mut pushes: Vec<(u128, String, [f64; 3], f32, f32)> = Vec::new();
         let mut ops_notes: Vec<String> = Vec::new();
         let mut vital_changes: Vec<(u128, Change)> = Vec::new();
+        let mut lock_actions: Vec<(u128, String, wg::session::Action)> = Vec::new();
         let now_ms = st.ticks * 1000 / TPS;
         for np in &players {
             let p = st.player(np);
@@ -1659,6 +2311,18 @@ impl Hooks for Mod {
                 }
             }
         }
+        // `weather-lock` and `time-lock`: what each player sees while a region locks it.
+        {
+            let ps: Vec<Player> = players.iter().map(|np| st.player(np)).collect();
+            let State { guard, sessions, .. } = &mut *st;
+            for (np, p) in players.iter().zip(&ps) {
+                let weather = guard.lock_value(p, "weather-lock");
+                let time = guard.lock_value(p, "time-lock");
+                for a in sessions.step(np.uuid, weather.as_deref(), time.as_deref()) {
+                    lock_actions.push((np.uuid, np.dimension.clone(), a));
+                }
+            }
+        }
         // One position a second per player, the last four: where `teleport-on-void-falling` and
         // `teleport-on-suffocation` put a player back.
         let online_set: HashSet<u128> = players.iter().map(|p| p.uuid).collect();
@@ -1688,15 +2352,94 @@ impl Hooks for Mod {
                 at[0] - r, at[1] - r, at[2] - r, at[0] + r, at[1] + r, at[2] + r
             ));
         }
+        // `default.pumpkin-scuba`: who wears a carved pumpkin or a jack o'lantern (twice a second).
+        if st.ticks % 10 == 0 {
+            let mut worn = HashSet::new();
+            for np in &players {
+                let head = host.living(np.player.entity()).and_then(|l| l.equipment(&*host, EquipmentSlot::Head));
+                if let Some(id) = head.map(|h| h.item().id(&*host).to_string())
+                    && matches!(id.strip_prefix("minecraft:").unwrap_or(&id), "carved_pumpkin" | "jack_o_lantern")
+                {
+                    worn.insert(np.uuid);
+                }
+            }
+            st.pumpkin = worn;
+        }
+        // An invincible player's fire is put out (`InvincibilityListener` cancels the combustion and clears the fire).
+        let mut put_out: Vec<u128> = Vec::new();
+        if st.ticks % 4 == 0 {
+            for np in &players {
+                let burning = np.player.entity().fire_ticks(&*host).is_some_and(|t| t > 0);
+                if burning {
+                    let p = st.player(np);
+                    if st.guard.invincible(&p, st.god.contains(&np.uuid), st.god_override.contains(&np.uuid)) {
+                        put_out.push(np.uuid);
+                    }
+                }
+            }
+        }
+        let air_resets = std::mem::take(&mut st.air_resets);
+        let kill_mobs = std::mem::take(&mut st.kill_mobs);
+        // `uuid-migration-on-start`: once, when the regions are loaded and a name is left in an owner or member list.
+        let migrate = st.loaded
+            && !st.migrated
+            && {
+                st.migrated = true;
+                st.guard.cfg.migrate_regions_to_uuid
+                    && st
+                        .guard
+                        .worlds
+                        .values()
+                        .any(|w| w.all().any(|r| !r.owners.players.is_empty() || !r.members.players.is_empty()))
+            };
         let cmds = std::mem::take(&mut st.commands);
         let op_level = st.guard.cfg.op_level;
         if st.save_at.is_some_and(|t| st.ticks >= t) {
             st.save_at = None;
             st.save_dirty();
         }
+        let sweep = st.guard.activity_halted && st.ticks % (TPS * 10) == 0;
+        let sweep_cfg = if sweep { Some(st.guard.cfg.clone()) } else { None };
         drop(st);
+        if let Some(cfg) = sweep_cfg {
+            // `/halt-activity`: what loaded or spawned in since the last sweep (WorldGuard does it per chunk load).
+            let removed: usize = sweep_intensive(host, &cfg).iter().map(|(_, n)| n).sum();
+            if removed > 50 {
+                eprintln!("[worldguard] Halt-Act: {removed} entities (>50) auto-removed");
+            }
+        }
+        for u in put_out {
+            if let Some(p) = host.player(u) {
+                let _ = p.entity().extinguish_fire(&mut *host);
+            }
+        }
+        for u in air_resets {
+            if let Some(p) = host.player(u) {
+                let e = p.entity();
+                if let Some(max) = e.max_air_supply(&*host) {
+                    let _ = e.set_air_supply(&mut *host, max);
+                }
+            }
+        }
+        for id in kill_mobs {
+            // A tamed pet is not removed (WorldGuard spares them; its tame flag cannot be read here, so every
+            // tamable kind is spared).
+            let Some(e) = host.entity(id as u32) else { continue };
+            let kind = e.kind(&*host).map(|k| k.id(&*host).to_string()).unwrap_or_default();
+            if !matches!(kind.strip_prefix("minecraft:").unwrap_or(&kind), "wolf" | "cat" | "parrot" | "horse" | "donkey" | "mule" | "llama" | "trader_llama" | "camel" | "skeleton_horse" | "zombie_horse" | "player") {
+                let _ = e.discard(&mut *host);
+            }
+        }
+        if migrate {
+            for l in self.region_command(&mut *host, None, "migrateuuid") {
+                eprintln!("[worldguard] {}", text::plain(&l));
+            }
+        }
         for (u, dim, to, yaw, pitch) in pushes {
             teleport(host, u, &dim, to, yaw, pitch);
+        }
+        for (u, dim, action) in lock_actions {
+            apply_lock(host, u, &dim, action);
         }
         for (u, change) in vital_changes {
             let Some(player) = host.player(u) else { continue };
@@ -1749,6 +2492,9 @@ impl Hooks for Mod {
             event.name.to_ascii_lowercase(),
             (event.player, event.name.to_owned()),
         );
+        // `PlayerModesListener`: auto-god and amphibious mode, decided once a second from now on (the permission
+        // provider may not know the player yet).
+        st.pending_auto.insert(event.player);
         if st.guard.cfg.announce_bypass_status
             && let Some(np) = host.player(event.player).and_then(|p| snap(&*host, p))
         {
@@ -1773,8 +2519,20 @@ impl Hooks for Mod {
         let mut st = lock(&self.st);
         st.tracker.forget(event.player);
         st.god.remove(&event.player);
+        let st = &mut *st;
+        for set in [
+            &mut st.pending_auto,
+            &mut st.god_override,
+            &mut st.amphibious,
+            &mut st.pumpkin,
+            &mut st.potion_override,
+            &mut st.infinite_override,
+        ] {
+            set.remove(&event.player);
+        }
         st.vitals.forget(event.player);
         st.bypass.remove(&event.player);
+        st.sessions.forget(event.player);
     }
 
     // -- blocks ----------------------------------------------------------------------------
@@ -1786,7 +2544,7 @@ impl Hooks for Mod {
         let Some(np) = snap(&*host, ap) else {
             return Flow::Continue;
         };
-        let st = lock(&self.st);
+        let mut st = lock(&self.st);
         let p = st.player(&np);
         match st.guard.break_block(&p, bp(event.pos)) {
             Ok(()) => {
@@ -1797,6 +2555,8 @@ impl Hooks for Mod {
                 }
             }
             Err(d) => {
+                // `use-particle-effects`: a puff of smoke over the block (`playDenyEffect`).
+                st.deny_smoke(&p, [f64::from(event.pos[0]) + 0.5, f64::from(event.pos[1]) + 1.0, f64::from(event.pos[2]) + 0.5]);
                 drop(st);
                 return Self::denied(host, &p, &d.message);
             }
@@ -1901,6 +2661,10 @@ impl Hooks for Mod {
         };
         let pos = bp_of([event.pos.x, event.pos.y, event.pos.z]);
         if matches!(self.player_check(host, uuid, |g, p| g.place_block(p, pos)), Flow::Cancel) {
+            let mut st = lock(&self.st);
+            if let Some(p) = st.cached(uuid) {
+                st.deny_smoke(&p, [f64::from(event.pos.x) + 0.5, f64::from(event.pos.y) + 0.5, f64::from(event.pos.z) + 0.5]);
+            }
             return Flow::Cancel;
         }
         let Some(p) = lock(&self.st).cached(uuid) else {
@@ -1951,11 +2715,10 @@ impl Hooks for Mod {
                 g.hanging_break(Some(p), &p.dimension.clone(), bp(pos), kind)
             }),
             None => {
-                // No dimension in the event: the overworld's regions decide.
                 let st = lock(&self.st);
                 if st
                     .guard
-                    .hanging_break(None, OVERWORLD, bp(pos), kind)
+                    .hanging_break(None, event.dimension, bp(pos), kind)
                     .is_ok()
                 {
                     Flow::Continue
@@ -1966,16 +2729,30 @@ impl Hooks for Mod {
         }
     }
 
+    /// A click's TNT is asked here with its player; the arrow, dispenser, fire and redstone cases are asked in
+    /// `tnt_primed_detail`, which knows the level and the shooter.
     fn tnt_primed(&self, host: &mut dyn ServerHost, event: &mut TntPrimedEvent) -> Flow {
         let pos = event.pos;
         match event.player {
             Some(u) => self.player_check(host, u, |g, p| {
                 g.tnt_prime(Some(p), &p.dimension.clone(), bp(pos))
             }),
+            None => Flow::Continue,
+        }
+    }
+
+    /// TNT lit by an arrow is refused for its shooter (`tnt` flag, `ProtectionDetail` of WorldGuard's
+    /// `onTNTPrime`); with no player behind it the level's own regions decide. A click was asked in `tnt_primed`.
+    fn tnt_primed_detail(&self, host: &mut dyn ServerHost, event: &mut TntPrimedDetailEvent<'_>) -> Flow {
+        let pos = event.pos;
+        match event.player {
+            Some(u) if event.cause == "projectile" => {
+                self.player_check(host, u, |g, p| g.tnt_prime(Some(p), &p.dimension.clone(), bp(pos)))
+            }
+            Some(_) => Flow::Continue,
             None => {
-                // No dimension in the event: the overworld's regions decide.
                 let st = lock(&self.st);
-                if st.guard.tnt_prime(None, OVERWORLD, bp(pos)).is_ok() {
+                if st.guard.tnt_prime(None, event.dimension, bp(pos)).is_ok() {
                     Flow::Continue
                 } else {
                     Flow::Cancel
@@ -2183,6 +2960,143 @@ impl Hooks for Mod {
         } else {
             Flow::Cancel
         }
+    }
+
+    /// `vine-growth` and `sculk-growth` (and `dynamics.disable-vine-growth`, `disable-sculk-growth`): a vine or sculk
+    /// spreading into `to`. Grass, mycelium and rock growth have no hook yet.
+    fn natural_block_spread(&self, _level: &dyn LevelHost, event: &mut NaturalBlockSpreadEvent<'_>) -> Flow {
+        let block = match event.kind {
+            "vine" => "minecraft:vine",
+            "sculk" => "minecraft:sculk",
+            _ => return Flow::Continue,
+        };
+        let at = bp_of([event.to.x, event.to.y, event.to.z]);
+        if lock(&self.st).guard.block_grow(&dim_id(&event.dimension), at, block) {
+            Flow::Continue
+        } else {
+            Flow::Cancel
+        }
+    }
+
+    /// `sculk-growth`: a sculk block growing in place (a shrieker or sensor above a charged block).
+    fn block_grow(&self, level: &dyn LevelHost, event: &mut BlockGrowEvent) -> Flow {
+        let block = state_name(level, event.to);
+        let at = bp_of([event.pos.x, event.pos.y, event.pos.z]);
+        if lock(&self.st).guard.block_grow(&dim_id(&event.dimension), at, &block) {
+            Flow::Continue
+        } else {
+            Flow::Cancel
+        }
+    }
+
+    /// `potion-splash`: a thrown potion about to apply its effects. WorldGuard asks the flag at each affected
+    /// entity; the hook names the landing spot only, so the flag is read there. The hook names no dimension: the
+    /// thrower's decides, else the potion is kept only when a world without the flag could hold it.
+    fn potion_splash_cancel(&self, host: &mut dyn ServerHost, event: &mut PotionSplashCancelEvent<'_>) -> Flow {
+        let at = BlockPos::of(event.pos);
+        let dimension = acting_dimension(&*host);
+        let st = lock(&self.st);
+        let allowed = match dimension {
+            Some(d) => st.guard.cloud_spawns(&d, at),
+            None => {
+                let dims = region_dimensions(&st.guard);
+                dims.is_empty() || dims.iter().any(|d| st.guard.cloud_spawns(d, at))
+            }
+        };
+        if allowed { Flow::Continue } else { Flow::Cancel }
+    }
+
+    /// `mobs.block-zombie-door-destruction`.
+    fn entity_break_door_cancel(&self, host: &mut dyn ServerHost, event: &mut EntityBreakDoorCancelEvent<'_>) -> Flow {
+        let dimension = host
+            .entity(event.entity)
+            .and_then(|e| e.level(&*host))
+            .map(|l| l.dimension_id().to_string())
+            .unwrap_or_else(|| OVERWORLD.to_owned());
+        if lock(&self.st).guard.door_break_blocked(&dimension) { Flow::Cancel } else { Flow::Continue }
+    }
+
+    /// `player-damage.disable-death-messages`: nothing is said when a player dies.
+    fn player_death_message(&self, host: &mut dyn ServerHost, event: &mut PlayerDeathMessageEvent<'_>) {
+        let dimension = host
+            .player(event.player)
+            .and_then(|p| p.level(&*host))
+            .map(|l| l.dimension_id().to_string())
+            .unwrap_or_else(|| OVERWORLD.to_owned());
+        if lock(&self.st).guard.rule(&dimension, "player-damage.disable-death-messages") {
+            *event.message = None;
+        }
+    }
+
+    /// `physics.no-physics-sand|gravel`: a gravity block that would start to fall stays.
+    fn block_physics_cancel(&self, level: &dyn LevelHost, event: &mut BlockPhysicsCancelEvent<'_>) -> Flow {
+        let block = state_name(level, event.block);
+        let id = block.strip_prefix("minecraft:").unwrap_or(&block);
+        let dimension = dim_id(&event.dimension);
+        let option = match (event.source, id) {
+            ("falling", "gravel") => "physics.no-physics-gravel",
+            ("falling", "sand" | "red_sand") => "physics.no-physics-sand",
+            // A portal block that lost its frame stays (`allow-portal-anywhere`).
+            ("neighbor", "nether_portal") => "physics.allow-portal-anywhere",
+            // A ladder with a ladder above it holds on to nothing (`vine-like-rope-ladders`).
+            ("neighbor", "ladder") => {
+                let pos: [i32; 3] = [event.pos.x, event.pos.y, event.pos.z];
+                if level_block(level, [pos[0], pos[1] + 1, pos[2]]) != "minecraft:ladder" {
+                    return Flow::Continue;
+                }
+                "physics.vine-like-rope-ladders"
+            }
+            _ => return Flow::Continue,
+        };
+        if lock(&self.st).guard.rule(&dimension, option) { Flow::Cancel } else { Flow::Continue }
+    }
+
+    /// `grass-growth`, `mycelium-spread` (and `dynamics.disable-grass-growth|mycelium-spread`).
+    fn block_growth_cancel(&self, _level: &dyn LevelHost, event: &mut BlockGrowthCancelEvent<'_>) -> Flow {
+        let block = match event.kind {
+            "grass" => "minecraft:grass_block",
+            "mycelium" => "minecraft:mycelium",
+            "dripstone" => "minecraft:pointed_dripstone",
+            _ => return Flow::Continue,
+        };
+        let at = bp_of([event.to.x, event.to.y, event.to.z]);
+        if lock(&self.st).guard.block_grow(&dim_id(&event.dimension), at, block) { Flow::Continue } else { Flow::Cancel }
+    }
+
+    /// `natural-health-regen`: regeneration and satiated heals of a player in a region that denies it.
+    fn living_heal_cause_cancel(&self, _context: &dyn LoopContext, event: &mut LivingHealCauseCancelEvent<'_>) -> Flow {
+        if !matches!(event.cause, "regeneration" | "satiated") {
+            return Flow::Continue;
+        }
+        let st = lock(&self.st);
+        let Some(p) = st.by_entity.get(&(event.entity as i32)).map(|s| st.player(s)) else {
+            return Flow::Continue;
+        };
+        if st.guard.natural_regen(&p) { Flow::Continue } else { Flow::Cancel }
+    }
+
+    /// `mobs.block-enderdragon-portal-creation`: the exit portal of a killed ender dragon is not placed.
+    fn portal_create_entity_cancel(&self, _host: &mut dyn ServerHost, event: &mut PortalCreateEntityCancelEvent<'_>) -> Flow {
+        if lock(&self.st).guard.rule(&dim_id(&event.dimension), "mobs.block-enderdragon-portal-creation") {
+            Flow::Cancel
+        } else {
+            Flow::Continue
+        }
+    }
+
+    /// The blacklist's `on-equip`.
+    fn armor_equip_cancel(&self, host: &mut dyn ServerHost, event: &mut ArmorEquipCancelEvent<'_>) -> Flow {
+        let Some(p) = lock(&self.st).cached(event.player) else {
+            return Flow::Continue;
+        };
+        let item = event.item.item().id(&*host).to_string();
+        if self.blacklist_check(host, &p, EventType::Equip, &item, false) { Flow::Continue } else { Flow::Cancel }
+    }
+
+    /// The blacklist's `on-dispense`.
+    fn block_dispense(&self, host: &mut dyn ServerHost, event: &mut BlockDispenseEvent<'_>) -> Flow {
+        let item = event.stack.item().id(&*host).to_string();
+        if self.dispense_allowed(event.dimension, &item) { Flow::Continue } else { Flow::Cancel }
     }
 
     /// `weather.disable-weather`, `disable-thunderstorm`, `always-raining`, `always-thundering`.
@@ -2395,7 +3309,8 @@ impl Hooks for Mod {
     /// heals at most one point at a time, so only heals of one point or less are held back
     /// (HMOD-GAP(heal_cause): a Regeneration effect is held back too).
     fn living_heal(&self, _context: &dyn LoopContext, event: &mut LivingHealEvent) -> Flow {
-        if event.amount > 1.0 {
+        if true || event.amount > 1.0 {
+            // The cause decides (`living_heal_cause_cancel`).
             return Flow::Continue;
         }
         let st = lock(&self.st);
@@ -2422,6 +3337,10 @@ impl Hooks for Mod {
         let Some(p) = st.cached(event.player) else {
             return Flow::Continue;
         };
+        // `InvincibilityListener.onFoodLevelChange`: an invincible player does not get hungry.
+        if st.guard.invincible(&p, st.god.contains(&event.player), st.god_override.contains(&event.player)) {
+            return Flow::Cancel;
+        }
         if st.guard.natural_hunger(&p) {
             Flow::Continue
         } else {
@@ -2516,6 +3435,20 @@ impl Hooks for Mod {
             // `mobs.block-vehicle-entry`
             return Flow::Cancel;
         }
+        if !event.mounting && event.kind == "minecraft:player" && wg::kinds::is_tameable(event.vehicle_kind) {
+            // `RegionProtectionListener.onVehicleExit`: a rider who could not get back on is not let off a tameable
+            // mount where `ride` and `interact` are denied (the dismount is asked again on the next tick).
+            let at = host.entity(event.vehicle).and_then(|e| e.position(&*host));
+            let st = lock(&self.st);
+            let Some(p) = st.by_entity.get(&(event.entity as i32)).map(|s| st.player(s)) else {
+                return Flow::Continue;
+            };
+            if st.guard.mount(&p, event.vehicle_kind, at.unwrap_or(p.pos)).is_ok() {
+                return Flow::Continue;
+            }
+            drop(st);
+            return Self::denied(host, &p, "&6Don't disembark here!&7 You can't get back on.");
+        }
         if !event.mounting || event.kind != "minecraft:player" {
             return Flow::Continue;
         }
@@ -2550,17 +3483,30 @@ impl Hooks for Mod {
         if event.kind != "minecraft:player" {
             return Flow::Continue;
         }
-        let st = lock(&self.st);
-        if st
-            .by_entity
-            .get(&event.entity)
-            .is_some_and(|v| st.god.contains(&v.uuid))
-        {
-            return Flow::Cancel;
-        }
+        let mut st = lock(&self.st);
         let Some(victim) = st.by_entity.get(&event.entity).map(|v| st.player(v)) else {
             return Flow::Continue;
         };
+        let uuid = victim.subject.uuid;
+        // `InvincibilityListener.onEntityDamage`: god mode or the `invincible` flag; the flag's deny beats god mode
+        // unless the player holds `worldguard.god.override-regions`. The fire is put out at the next tick.
+        let (god, over) = (st.god.contains(&uuid), st.god_override.contains(&uuid));
+        if st.guard.invincible(&victim, god, over) {
+            let by = event.source.causing;
+            if st.guard.cfg.invincibility_removes_mobs && by != 0 && by != event.entity && !st.by_entity.contains_key(&by) {
+                st.kill_mobs.push(by);
+            }
+            return Flow::Cancel;
+        }
+        // Amphibious mode and `default.pumpkin-scuba`: drowning does nothing, the air is refilled.
+        let drowning = event.source.damage_type.strip_prefix("minecraft:").unwrap_or(event.source.damage_type) == "drown";
+        if drowning
+            && (st.amphibious.contains(&uuid)
+                || (st.pumpkin.contains(&uuid) && st.guard.rule(&victim.dimension, "default.pumpkin-scuba")))
+        {
+            st.air_resets.push(uuid);
+            return Flow::Cancel;
+        }
         if st.guard.damage_rescues(&victim, event.source.damage_type) {
             // `teleport-on-void-falling` / `teleport-on-suffocation`: no damage, and the next tick moves the player.
             let uuid = victim.subject.uuid;
@@ -2737,6 +3683,90 @@ impl Hooks for Mod {
         lock(&self.st).teleported.insert(event.player);
     }
 
+    /// `gameplay.disable-conduit-effects` and `gameplay.block-potions` (engine branch fam-worldguard-gameplay-cancels). The hook names the target, not who threw or drank: a target with
+    /// `worldguard.override.potions` is let through (unless `block-potions-overly-reliably`), anyone else is told.
+    fn mob_effect_apply_cancel(&self, host: &mut dyn ServerHost, event: &mut MobEffectApplyCancelEvent<'_>) -> Flow {
+        let dimension = host
+            .entity(event.entity as u32)
+            .and_then(|e| e.level(&*host))
+            .map(|l| l.dimension_id().to_string())
+            .unwrap_or_else(|| OVERWORLD.to_owned());
+        let mut st = lock(&self.st);
+        if event.source == "conduit" && st.guard.conduit_blocked(&dimension) {
+            return Flow::Cancel;
+        }
+        if event.source == "potion" && st.guard.potion_blocked(&dimension, event.effect) {
+            let reliably = st.guard.rule(&dimension, "gameplay.block-potions-overly-reliably");
+            if let Some(uuid) = st.by_entity.get(&(event.entity as i32)).map(|p| p.uuid) {
+                if st.potion_override.contains(&uuid) && !reliably {
+                    return Flow::Continue;
+                }
+                let name = wg::blacklist::friendly(event.effect);
+                st.tells.push((uuid, format!("&cSorry, potions with {name} are presently disabled.")));
+            }
+            return Flow::Cancel;
+        }
+        Flow::Continue
+    }
+
+    /// `protection.remove-infinite-stacks`: a stack above its item's maximum is removed the moment it arrives
+    /// (the original removes stacks with a negative count, which the game no longer has).
+    fn player_oversize_stack(&self, _host: &mut dyn ServerHost, event: &mut PlayerOversizeStackEvent<'_>) -> Flow {
+        let mut st = lock(&self.st);
+        let dimension = st.by_uuid.get(&event.player).map(|p| p.dimension.clone()).unwrap_or_else(|| OVERWORLD.to_owned());
+        if !st.guard.infinite_stacks_removed(&dimension) || st.infinite_override.contains(&event.player) {
+            return Flow::Continue;
+        }
+        st.tells.push((event.player, format!("&cInfinite stack in slot #{} removed.", event.slot)));
+        Flow::Cancel
+    }
+
+    /// `mobs.anti-wolf-dumbness`: a tamed wolf takes no damage.
+    fn living_incoming_damage_detail(
+        &self,
+        _level: &mut dyn LevelRandomHost,
+        event: &mut LivingIncomingDamageDetailEvent<'_>,
+    ) -> Flow {
+        // The event names no dimension, so the overworld's option decides (as for armor stands).
+        if lock(&self.st).guard.tamed_wolf_protected(OVERWORLD, event.kind, event.victim_tamed, event.source.damage_type) {
+            Flow::Cancel
+        } else {
+            Flow::Continue
+        }
+    }
+
+    /// `/tp` and `/teleport` of a player: `entry`, and `exit` unless `exit-via-teleport` (WorldGuard's
+    /// `onPlayerTeleport` with `use-player-teleports`). The destination is asked before anything moves.
+    fn teleport_command(&self, host: &mut dyn ServerHost, event: &mut TeleportCommandEvent<'_>) -> Flow {
+        let st = lock(&self.st);
+        let Some(snap) = st.by_entity.get(&(event.entity as i32)).cloned() else {
+            return Flow::Continue;
+        };
+        let mut p = st.player(&snap);
+        let same = p.dimension == event.dimension;
+        p.dimension = event.dimension.to_owned();
+        p.pos = *event.to;
+        let Some(msg) = wg::movement::check_teleport(&st.guard, &p, event.from, same) else {
+            return Flow::Continue;
+        };
+        drop(st);
+        Self::denied(host, &p, &msg)
+    }
+
+    /// Portal use (`player-portal`): a nether portal that would put the player into a protected spot is refused.
+    fn entity_travel_to_dimension(&self, host: &mut dyn ServerHost, event: &mut EntityTravelToDimensionEvent<'_>) -> Flow {
+        let st = lock(&self.st);
+        let Some(snap) = st.by_entity.get(&(event.entity.id() as i32)).cloned() else {
+            return Flow::Continue;
+        };
+        let Some(msg) = self.player_portal_check(&st, snap.uuid, event.cause, event.dimension) else {
+            return Flow::Continue;
+        };
+        let p = st.player(&snap);
+        drop(st);
+        Self::denied(host, &p, &msg)
+    }
+
     fn can_player_sleep(&self, _host: &mut dyn ServerHost, event: &mut CanPlayerSleepEvent<'_>) {
         let st = lock(&self.st);
         let Some(p) = st.cached(event.player) else {
@@ -2766,16 +3796,13 @@ impl Hooks for Mod {
     fn tab_complete(&self, host: &mut dyn ServerHost, event: &mut TabCompleteEvent<'_>) {
         let command: &str = event.command;
         let Some(first_space) = command.find(' ') else { return };
-        let root = command[..first_space].to_ascii_lowercase();
-        let rest = &command[first_space + 1..];
-        let words = match root.as_str() {
-            "rg" | "region" | "regions" => self.complete_region(&mut *host, event.player, rest),
-            "wg" | "worldguard" => self.complete_wg(&mut *host, event.player, rest),
-            _ => return,
-        };
+        if !OUR_ROOTS.contains(&command[..first_space].to_ascii_lowercase().as_str()) {
+            return;
+        }
+        let names: Vec<String> = online(&*host).into_iter().map(|p| p.name).collect();
         let word_start = command.rfind(' ').map_or(0, |i| i + 1);
         let (from, to) = (event.range[0], event.range[1]);
-        for w in words {
+        for w in paper_words(&names, command) {
             // The engine's range may begin before the word (it took the rest of the line for one argument).
             let text = if word_start >= from { format!("{}{}", &command[from..word_start], w) } else { w };
             if !event.suggestions.iter().any(|s| s.text == text) {
@@ -2813,5 +3840,17 @@ impl Hooks for Mod {
                 Flow::Cancel
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod service_tests {
+    use super::*;
+
+    #[test]
+    fn the_region_service_describes_shapes() {
+        let c = wg::region::Region::new("spawn", wg::geom::Shape::cuboid(BlockPos::new(5, 0, 1), BlockPos::new(0, 9, 3)));
+        assert_eq!(region_reply(Some(&c)), "cuboid\t0\t0\t1\t5\t9\t3");
+        assert_eq!(region_reply(None), "none");
     }
 }
